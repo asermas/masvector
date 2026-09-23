@@ -1,0 +1,32 @@
+{
+  "name": "masvector-claude",
+  "version": "1.0.0",
+  "description": "MasVector — ajantların MCP ile profesyonel vektör çizim yaptığı Electron editörü (Claude sürümü)",
+  "type": "module",
+  "main": "src/ui/electron/main.cjs",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/build-ui.mjs",
+    "build:ui": "node scripts/build-ui.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "doc-server": "tsx src/bin/doc-server.ts",
+    "mcp-stdio": "tsx src/bin/mcp-stdio.ts",
+    "mcp-http": "tsx src/bin/mcp-http.ts",
+    "dev": "node scripts/build-ui.mjs && electron ."
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@napi-rs/canvas": "^1.0.9",
+    "clipper-lib": "^6.4.2",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "electron": "^41.7.1",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}
