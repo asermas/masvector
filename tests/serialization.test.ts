@@ -68,17 +68,17 @@ describe('SVG içe/dışa aktarma', () => {
     const nodes = [...walk(doc.pages[0].frames[0].nodes)].map((w) => w.node);
     const byId = (id: string) => nodes.find((n) => n.id === id)!;
     const circle = nodes.find((n) => n.type === 'ellipse' && n.style.fill === '#ff6600')!;
-    expect(circle.style.stroke).toBe('#222');
+    expect(circle.style.stroke).toBe('#222222');
     expect(circle.style.strokeWidth).toBe(3);
     expect(byId('special').style.opacity).toBe(0.5);
-    expect(byId('special').style.fill).toBe('rgb(10,20,30)');
+    expect(byId('special').style.fill).toBe('#0a141e');
     const r1 = byId('r1');
     expect(typeof r1.style.fill).toBe('object');
     expect((r1.style.fill as any).x2).toBeCloseTo(80); // objectBoundingBox → userSpace
-    const poly = nodes.find((n) => n.type === 'path' && (n as any).subpaths[0].points.length === 3 && (n as any).subpaths[0].closed && n.style.fill === 'green')!;
+    const poly = nodes.find((n) => n.type === 'path' && (n as any).subpaths[0].points.length === 3 && (n as any).subpaths[0].closed && n.style.fill === '#008000')!;
     expect(poly).toBeTruthy(); // grup fill kalıtımı
     const line = nodes.find((n) => n.type === 'line')!;
-    expect(line.style.stroke).toBe('#abc');
+    expect(line.style.stroke).toBe('#aabbcc');
     expect(line.style.strokeDasharray).toEqual([4, 2]);
     const text = nodes.find((n) => n.type === 'text') as any;
     expect(text.content).toBe('Merhaba & Dünya');
@@ -87,7 +87,7 @@ describe('SVG içe/dışa aktarma', () => {
     expect(use.children[0].type).toBe('path');
     expect((use.children[0].style.fill as any).y2).toBeCloseTo(15);
     const sh = nodes.find((n) => n.style.filters.length)!;
-    expect(sh.style.filters[0]).toEqual({ type: 'drop-shadow', dx: 2, dy: 3, blur: 4, color: '#000' });
+    expect(sh.style.filters[0]).toEqual({ type: 'drop-shadow', dx: 2, dy: 3, blur: 4, color: '#000000' });
     expect(warnings.some((w) => w.includes('tspan'))).toBe(true);
   });
 

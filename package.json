@@ -13,12 +13,14 @@
     "mcp-stdio": "tsx src/bin/mcp-stdio.ts",
     "mcp-http": "tsx src/bin/mcp-http.ts",
     "dev": "node scripts/build-ui.mjs && electron .",
-    "demo": "tsx scripts/demo-agent.ts"
+    "demo": "tsx scripts/demo-agent.ts",
+    "vectorize": "tsx src/bin/vectorize.ts"
   },
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@napi-rs/canvas": "^1.0.9",
+    "@neplex/vectorizer": "^0.1.0",
     "clipper-lib": "^6.4.2",
     "zod": "^4.6.5"
   },
@@ -33,7 +35,8 @@
   "bin": {
     "masvector-doc-server": "dist/bin/doc-server.js",
     "masvector-mcp-stdio": "dist/bin/mcp-stdio.js",
-    "masvector-mcp-http": "dist/bin/mcp-http.js"
+    "masvector-mcp-http": "dist/bin/mcp-http.js",
+    "masvector-vectorize": "dist/bin/vectorize.js"
   },
   "engines": {
     "node": ">=20"

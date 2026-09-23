@@ -1,4 +1,4 @@
-import type { Filter, Frame, Paint, Style, VDocument, VNode } from '../common/types.js';
+import type { Filter, Frame, Paint, Style, SubPath, VDocument, VNode } from '../common/types.js';
 import { toSvgTransform } from '../math/matrix.js';
 import { toPathData } from './path-data.js';
 
@@ -17,6 +17,11 @@ class Defs {
       this.items.push(`<linearGradient id="${id}" gradientUnits="userSpaceOnUse" x1="${n(p.x1)}" y1="${n(p.y1)}" x2="${n(p.x2)}" y2="${n(p.y2)}">${stops}</linearGradient>`);
     else
       this.items.push(`<radialGradient id="${id}" gradientUnits="userSpaceOnUse" cx="${n(p.cx)}" cy="${n(p.cy)}" r="${n(p.r)}"${p.fx !== undefined ? ` fx="${n(p.fx)}"` : ''}${p.fy !== undefined ? ` fy="${n(p.fy)}"` : ''}>${stops}</radialGradient>`);
+    return `url(#${id})`;
+  }
+  clip(sps: SubPath[], rule: string): string {
+    const id = this.id('cp');
+    this.items.push(`<clipPath id="${id}" clipPathUnits="userSpaceOnUse"><path d="${toPathData(sps)}"${rule === 'evenodd' ? ' clip-rule="evenodd"' : ''}/></clipPath>`);
     return `url(#${id})`;
   }
   filter(fs: Filter[]): string {
@@ -48,8 +53,8 @@ function styleAttrs(s: Style, defs: Defs, isGroup: boolean): string {
   return a.join(' ');
 }
 
-function nodeToSvg(node: VNode, defs: Defs, indent: string): string {
-  if (!node.visible && node.type !== 'group') return '';
+function nodeToSvg(node: VNode, defs: Defs, indent: string, skipHidden = false): string {
+  if (!node.visible && (node.type !== 'group' || skipHidden)) return '';
   const t = toSvgTransform(node.transform);
   const common = [`id="${esc(node.id)}"`];
   if (node.name) common.push(`data-name="${esc(node.name)}"`);
@@ -71,26 +76,28 @@ function nodeToSvg(node: VNode, defs: Defs, indent: string): string {
       return `${indent}<line ${attrs(`x1="${n(node.x1)}" y1="${n(node.y1)}" x2="${n(node.x2)}" y2="${n(node.y2)}"`)}/>`;
     case 'text':
       return `${indent}<text ${attrs(`x="${n(node.x)}" y="${n(node.y)}" font-size="${n(node.fontSize)}" font-family="${esc(node.fontFamily)}"${node.fontWeight ? ` font-weight="${esc(node.fontWeight)}"` : ''}${node.textAnchor && node.textAnchor !== 'start' ? ` text-anchor="${node.textAnchor}"` : ''}`)}>${esc(node.content)}</text>`;
+    case 'image':
+      return `${indent}<image ${attrs(`x="${n(node.x)}" y="${n(node.y)}" width="${n(node.width)}" height="${n(node.height)}" preserveAspectRatio="none" xlink:href="${esc(node.href)}"`)}/>`;
     case 'group': {
-      const kids = node.children.map((c) => nodeToSvg(c, defs, indent + '  ')).filter(Boolean).join('\n');
-      const extra = node.isLayer ? 'data-layer="true"' : '';
+      const kids = node.children.map((c) => nodeToSvg(c, defs, indent + '  ', skipHidden)).filter(Boolean).join('\n');
+      const extra = [node.isLayer ? 'data-layer="true"' : '', node.clip ? `clip-path="${defs.clip(node.clip.subpaths, node.clip.rule)}"` : ''].filter(Boolean).join(' ');
       return `${indent}<g ${attrs(extra)}>${kids ? `\n${kids}\n${indent}` : ''}</g>`;
     }
   }
 }
 
 /** Tek frame'i bağımsız SVG olarak dışa aktar (frame kendi koordinat sisteminde, 0,0 sol-üst). */
-export function frameToSVG(frame: Frame, opts: { background?: boolean } = {}): string {
+export function frameToSVG(frame: Frame, opts: { background?: boolean; skipHidden?: boolean } = {}): string {
   const defs = new Defs();
-  const body = frame.nodes.map((c) => nodeToSvg(c, defs, '  ')).filter(Boolean).join('\n');
+  const body = frame.nodes.map((c) => nodeToSvg(c, defs, '  ', opts.skipHidden)).filter(Boolean).join('\n');
   const bg = opts.background !== false && frame.background && frame.background !== 'none'
     ? `  <rect data-frame-background="true" x="0" y="0" width="${n(frame.w)}" height="${n(frame.h)}" fill="${esc(frame.background)}"/>\n` : '';
   const d = defs.items.length ? `  <defs>\n    ${defs.items.join('\n    ')}\n  </defs>\n` : '';
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${n(frame.w)}" height="${n(frame.h)}" viewBox="0 0 ${n(frame.w)} ${n(frame.h)}" data-frame-id="${esc(frame.id)}" data-frame-name="${esc(frame.name)}">\n${d}${bg}${body}\n</svg>\n`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${n(frame.w)}" height="${n(frame.h)}" viewBox="0 0 ${n(frame.w)} ${n(frame.h)}" data-frame-id="${esc(frame.id)}" data-frame-name="${esc(frame.name)}">\n${d}${bg}${body}\n</svg>\n`;
 }
 
 /** Belgeyi SVG'ye aktar: varsayılan olarak ilk sayfanın ilk frame'i (ya da frameId). */
-export function documentToSVG(doc: VDocument, frameId?: string, opts: { background?: boolean } = {}): string {
+export function documentToSVG(doc: VDocument, frameId?: string, opts: { background?: boolean; skipHidden?: boolean } = {}): string {
   for (const p of doc.pages) for (const f of p.frames) if (!frameId || f.id === frameId) return frameToSVG(f, opts);
   throw new Error(`Frame bulunamadı: ${frameId}`);
 }

@@ -90,14 +90,23 @@ export interface TextNode extends NodeBase {
   fontWeight?: string;
   textAnchor?: 'start' | 'middle' | 'end';
 }
+/** Gömülü raster görsel (PDF içindeki fotoğraflar, izleme referansı). `href` = data URI. */
+export interface ImageNode extends NodeBase {
+  type: 'image';
+  x: number; y: number; width: number; height: number;
+  href: string;
+}
+/** Kırpma maskesi: grup-yerel koordinatlarda; yalnız bu alanın içindeki çocuklar görünür. */
+export interface ClipMask { subpaths: SubPath[]; rule: 'nonzero' | 'evenodd' }
 export interface GroupNode extends NodeBase {
   type: 'group';
   /** Katman = frame'in en üst seviyesindeki `isLayer` grubu. */
   isLayer?: boolean;
+  clip?: ClipMask;
   children: VNode[];
 }
 
-export type VNode = PathNode | RectNode | EllipseNode | LineNode | TextNode | GroupNode;
+export type VNode = PathNode | RectNode | EllipseNode | LineNode | TextNode | ImageNode | GroupNode;
 export type NodeType = VNode['type'];
 
 export interface Guide { id: string; axis: 'x' | 'y'; value: number }

@@ -5,13 +5,15 @@ import { defaultStyle, newId } from '../common/ids.js';
 import { VectorError, invalid, notFound } from '../common/errors.js';
 import { around, apply, applyVec, identity, invert, multiply, parseSvgTransform, rotate, scale, skew, translate } from '../math/matrix.js';
 import { emptyBBox, isEmptyBBox, unionBBox } from '../math/bezier.js';
-import { bboxCenter, nodeBBox, nodePolygons, nodeSubPaths } from '../math/geometry.js';
+import { bboxCenter, clipPolygons, nodeBBox, nodePolygons, nodeSubPaths } from '../math/geometry.js';
+import { flattenSubPaths, transformSubPath } from '../math/bezier.js';
+import { fitClosedPolygon, fitOpenPolyline } from '../math/fit.js';
 import { parsePathData } from '../serialization/path-data.js';
 import {
   ancestorsMatrix, cloneWithNewIds, containerChildren, findFrame, findPage, isEffectivelyLocked, locate, mustLocate, walk,
   type Located, createFrame,
 } from './scene.js';
-import { booleanPolygons, offsetPolygons, polygonsToSubPaths, strokeToPolygons, type BoolOp, type Operand } from './boolean.js';
+import { booleanPolygons, clipRegion, normalizeRegion, offsetPolygons, polygonsToSubPaths, strokeToPolygons, type BoolOp, type Operand } from './boolean.js';
 import { OP_SCHEMAS, type OpArgs, type OpName } from './schemas.js';
 
 // ————————————————————————————————— yardımcılar
@@ -114,14 +116,28 @@ function firstLeafStyle(n: VNode): Style {
   return defaultStyle();
 }
 
-function operandOf(l: Located): Operand {
-  const hasText = l.node.type === 'text' || (l.node.type === 'group' && [...walk(l.node.children)].some((w) => w.node.type === 'text'));
-  if (hasText) throw new VectorError('UNSUPPORTED', `"${l.node.id}" metin içeriyor; boolean için metin desteklenmez`);
-  const { polys, closed } = nodePolygons(l.node, ancestorsMatrix(l.ancestors));
+/** Node'un frame uzayındaki dolu bölgesi (dolgu kuralı çözülmüş; grup kırpmaları uygulanmış). */
+function regionOf(n: VNode, parent: Matrix, owner: string): { x: number; y: number }[][] {
+  if (n.type === 'text') throw new VectorError('UNSUPPORTED', `"${owner}" metin içeriyor; boolean için metin desteklenmez (önce metni silin veya ayırın)`);
+  if (n.type === 'image') throw new VectorError('UNSUPPORTED', `"${owner}" raster görsel içeriyor; boolean için görsel desteklenmez`);
+  const m = multiply(parent, n.transform);
+  if (n.type === 'group') {
+    let region: { x: number; y: number }[][] = [];
+    for (const ch of n.children) if (ch.visible) region.push(...regionOf(ch, m, owner));
+    if (region.length) region = normalizeRegion({ polys: region, fillRule: 'nonzero' });
+    const cp = clipPolygons(n, m);
+    return cp ? clipRegion(region, { polys: cp, fillRule: n.clip!.rule }) : region;
+  }
+  const { polys, closed } = nodePolygons({ ...n, transform: identity() } as VNode, m);
   const closedPolys = polys.filter((_, i) => closed[i]);
-  if (!closedPolys.length) throw new VectorError('UNSUPPORTED', `"${l.node.id}" kapalı alan içermiyor (açık yol/çizgi). Önce path_outline_stroke kullanın.`);
-  const fillRule = l.node.type === 'path' ? l.node.fillRule : 'nonzero';
-  return { polys: closedPolys, fillRule };
+  if (!closedPolys.length) return [];
+  return normalizeRegion({ polys: closedPolys, fillRule: n.type === 'path' ? n.fillRule : 'nonzero' });
+}
+
+function operandOf(l: Located): Operand {
+  const polys = regionOf(l.node, ancestorsMatrix(l.ancestors), l.node.id);
+  if (!polys.length) throw new VectorError('UNSUPPORTED', `"${l.node.id}" kapalı alan içermiyor (açık yol/çizgi). Önce path_outline_stroke kullanın.`);
+  return { polys, fillRule: 'nonzero' };
 }
 
 /** Frame-uzayı poligonlarından `target`ın ebeveyn uzayında path node üret. */
@@ -197,6 +213,7 @@ const handlers: { [K in OpName]: Handler<K> } = {
       ellipse: ['x', 'y', 'width', 'height'],
       line: ['x1', 'y1', 'x2', 'y2'],
       text: ['x', 'y', 'content', 'fontSize', 'fontFamily', 'fontWeight', 'textAnchor'],
+      image: ['x', 'y', 'width', 'height'],
       group: [],
     };
     const keys = [...allowed[l.node.type], 'name', 'visible', 'locked'];
@@ -331,7 +348,7 @@ const handlers: { [K in OpName]: Handler<K> } = {
       const l = editable(doc, id);
       const n = l.node;
       if (n.type === 'path') return summarize(doc, id);
-      if (n.type === 'group' || n.type === 'text') throw new VectorError('UNSUPPORTED', `${n.type} path'e çevrilemez`);
+      if (n.type === 'group' || n.type === 'text' || n.type === 'image') throw new VectorError('UNSUPPORTED', `${n.type} path'e çevrilemez`);
       const p: PathNode = {
         type: 'path', id: n.id, name: n.name, transform: n.transform, style: n.style, visible: n.visible, locked: n.locked,
         subpaths: structuredClone(nodeSubPaths(n)), fillRule: 'nonzero',
@@ -360,7 +377,7 @@ const handlers: { [K in OpName]: Handler<K> } = {
   path_outline_stroke(doc, a) {
     const l = editable(doc, a.id);
     const n = l.node;
-    if (n.type === 'group' || n.type === 'text') throw new VectorError('UNSUPPORTED', `${n.type} için kontur dönüştürme desteklenmez`);
+    if (n.type === 'group' || n.type === 'text' || n.type === 'image') throw new VectorError('UNSUPPORTED', `${n.type} için kontur dönüştürme desteklenmez`);
     if (n.style.stroke === 'none' || n.style.strokeWidth <= 0) throw invalid('Node\'un konturu yok');
     const A = ancestorsMatrix(l.ancestors);
     const { polys, closed } = nodePolygons(n, A);
@@ -550,6 +567,81 @@ const handlers: { [K in OpName]: Handler<K> } = {
       translateNode(l, dx, dy);
     }
     return a.ids.map((id) => summarize(doc, id));
+  },
+
+  node_add_image(doc, a) {
+    if (!/^data:image\/(png|jpe?g|webp|gif|bmp|svg\+xml);base64,/i.test(a.href)) throw invalid('href data:image/...;base64 biçiminde olmalı (dosya için doc_import/vectorize_image kullanın)');
+    const n: VNode = { type: 'image', ...base('image', a, mkStyle(a.style as Partial<Style>, { fill: 'none' })), x: a.x, y: a.y, width: a.width, height: a.height, href: a.href };
+    return addNode(doc, n, a.parentId, a.index);
+  },
+
+  clip_create(doc, a) {
+    // Illustrator "kırpma maskesi oluştur": maske şekli seçimin en üstündeki (ya da maskId) node'dur.
+    const locs = a.ids.map((id) => editable(doc, id));
+    const order = new Map<string, number>();
+    let k = 0;
+    for (const p of doc.pages) for (const f of p.frames) for (const w of walk(f.nodes)) order.set(w.node.id, k++);
+    locs.sort((x, y) => order.get(x.node.id)! - order.get(y.node.id)!);
+    const maskLoc = a.maskId ? locs.find((l) => l.node.id === a.maskId) : locs[locs.length - 1];
+    if (!maskLoc) throw notFound(`Maske "${a.maskId}" seçimde yok`);
+    const content = locs.filter((l) => l !== maskLoc);
+    if (!content.length) throw invalid('Maskeyle kırpılacak en az bir node gerekli');
+    const mask = maskLoc.node;
+    if (mask.type === 'group' || mask.type === 'text' || mask.type === 'image') throw new VectorError('UNSUPPORTED', 'Maske şekli path/rect/ellipse olmalı');
+    const first = content[0];
+    const g: GroupNode = {
+      type: 'group', id: newId('clipgroup'), name: a.name ?? 'Kırpma grubu', transform: identity(), style: defaultStyle({ fill: 'none' }),
+      visible: true, locked: false, children: [],
+      clip: { subpaths: [], rule: mask.type === 'path' ? mask.fillRule : 'nonzero' },
+    };
+    const container = first.siblings, target = first.ancestors;
+    insertAt(container, g, container.indexOf(first.node) + 1);
+    // Maskeyi grup uzayına taşı
+    const mm = multiply(invert(ancestorsMatrix([...target, g])), multiply(ancestorsMatrix(maskLoc.ancestors), mask.transform));
+    g.clip!.subpaths = nodeSubPaths(mask).map((sp) => transformSubPath(sp, mm));
+    detach(maskLoc);
+    for (const l of content) {
+      const cur = mustLocate(doc, l.node.id);
+      detach(cur);
+      reparentTransform(cur.node, cur.ancestors, [...target, g]);
+      g.children.push(cur.node);
+    }
+    return { ...summarize(doc, g.id), children: content.map((l) => l.node.id) };
+  },
+
+  clip_release(doc, a) {
+    const l = editable(doc, a.id);
+    if (l.node.type !== 'group' || !l.node.clip) throw invalid(`"${a.id}" kırpma maskesi olan bir grup değil`);
+    const g = l.node;
+    const mask: PathNode = {
+      type: 'path', id: newId('path'), name: 'Maske', transform: identity(), visible: true, locked: false,
+      style: defaultStyle({ fill: 'none', stroke: '#888888', strokeWidth: 1 }), subpaths: structuredClone(g.clip!.subpaths), fillRule: g.clip!.rule,
+    };
+    delete g.clip;
+    g.children.push(mask);
+    return { id: g.id, maskId: mask.id };
+  },
+
+  path_simplify(doc, a) {
+    const tol = a.tolerance ?? 0.5;
+    const out: unknown[] = [];
+    for (const id of a.ids) {
+      const l = editable(doc, id);
+      const targets = l.node.type === 'group' ? [...walk(l.node.children)].map((w) => w.node) : [l.node];
+      let before = 0, after = 0;
+      for (const n of targets) {
+        if (n.type !== 'path' || isEffectivelyLocked(mustLocate(doc, n.id))) continue;
+        before += n.subpaths.reduce((s, sp) => s + sp.points.length, 0);
+        n.subpaths = n.subpaths.map((sp) => {
+          if (sp.points.length < 3) return sp;
+          const [poly] = flattenSubPaths([sp], Math.min(tol / 4, 0.1));
+          return sp.closed ? fitClosedPolygon(poly, tol, a.cornerAngle ?? 32) : fitOpenPolyline(poly, tol, a.cornerAngle ?? 32);
+        });
+        after += n.subpaths.reduce((s, sp) => s + sp.points.length, 0);
+      }
+      out.push({ id, anchorsBefore: before, anchorsAfter: after });
+    }
+    return out;
   },
 
   distribute(doc, a) {

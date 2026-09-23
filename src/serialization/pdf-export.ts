@@ -1,5 +1,7 @@
 import type { Frame, Matrix, Paint, Style, SubPath, VDocument, VNode } from '../common/types.js';
-import { segments } from '../math/bezier.js';
+import { deflateSync } from 'node:zlib';
+import { segments, transformSubPath } from '../math/bezier.js';
+import { nodeImage } from '../render/png.js';
 import { nodeSubPaths } from '../math/geometry.js';
 import { multiply } from '../math/matrix.js';
 import { findFrame } from '../model/scene.js';
@@ -44,6 +46,29 @@ class PdfWriter {
   private shadings: string[] = [];
   private ops: string[] = [];
   private usesFont = new Set<string>();
+  private images: { name: string; w: number; h: number; rgb: Buffer; alpha: Buffer | null }[] = [];
+  private imageByHref = new Map<string, string | null>();
+
+  /** data URI → PDF görüntü XObject (RGB Flate + gerekirse alfa SMask). */
+  private imageXObject(href: string): string | null {
+    if (this.imageByHref.has(href)) return this.imageByHref.get(href)!;
+    const img = nodeImage(href);
+    let name: string | null = null;
+    if (img) {
+      const px = img.rgba;
+      const n = img.width * img.height;
+      const rgb = Buffer.alloc(n * 3), a = Buffer.alloc(n);
+      let hasAlpha = false;
+      for (let i = 0; i < n; i++) {
+        rgb[i * 3] = px[i * 4]; rgb[i * 3 + 1] = px[i * 4 + 1]; rgb[i * 3 + 2] = px[i * 4 + 2];
+        a[i] = px[i * 4 + 3]; if (a[i] !== 255) hasAlpha = true;
+      }
+      name = `Im${this.images.length + 1}`;
+      this.images.push({ name, w: img.width, h: img.height, rgb: deflateSync(rgb), alpha: hasAlpha ? deflateSync(a) : null });
+    } else this.warnings.add('PDF: çözülemeyen görsel atlandı');
+    this.imageByHref.set(href, name);
+    return name;
+  }
 
   constructor(private frame: Frame) {}
 
@@ -105,6 +130,16 @@ class PdfWriter {
     const blend = BLEND_PDF[s.blendMode] ?? 'Normal';
     const fa = alpha * s.opacity * (s.fillOpacity ?? 1), sa = alpha * s.opacity * (s.strokeOpacity ?? 1);
 
+    if (n.type === 'image') {
+      const name = this.imageXObject(n.href);
+      if (!name) return;
+      // Görüntü uzayı birim kare, y yukarı: (x, y+h) köşesinden w×(−h)
+      this.ops.push('q', `/${this.extGState(alpha * s.opacity, alpha * s.opacity, blend)} gs`);
+      this.cm(m);
+      this.ops.push(`${f(n.width)} 0 0 ${f(-n.height)} ${f(n.x)} ${f(n.y + n.height)} cm`, `/${name} Do`, 'Q');
+      return;
+    }
+
     if (n.type === 'text') {
       if (typeof s.fill !== 'string') this.warnings.add('PDF: metin gradyanı düz renge indirildi');
       this.ops.push('q'); this.cm(m);
@@ -159,7 +194,14 @@ class PdfWriter {
     const m = multiply(parent, n.transform);
     if (n.type === 'group') {
       if (n.style.blendMode !== 'normal' || n.style.filters.length) this.warnings.add('PDF: grup karışım/filtresi yapraklara uygulanmadı');
+      if (n.clip) {
+        // Kırpma yolunu mutlak koordinatta yaz; çocuklar kendi tam matrisleriyle bu q..Q içinde çizilir
+        this.ops.push('q');
+        this.path(n.clip.subpaths.map((sp) => transformSubPath(sp, m)));
+        this.ops.push(n.clip.rule === 'evenodd' ? 'W* n' : 'W n');
+      }
       for (const c of n.children) this.node(c, m, alpha * n.style.opacity);
+      if (n.clip) this.ops.push('Q');
     } else this.leaf(n, m, alpha);
   }
 
@@ -186,13 +228,20 @@ class PdfWriter {
       return `/${name} ${add(`<< /Type /ExtGState /ca ${fa} /CA ${sa} /BM /${bm} >>`)} 0 R`;
     });
     const shEntries = this.shadings.map((s, i) => `/Sh${i + 1} ${add(s)} 0 R`);
+    const xobjEntries = this.images.map((im) => {
+      const smask = im.alpha
+        ? add(`<< /Type /XObject /Subtype /Image /Width ${im.w} /Height ${im.h} /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length ${im.alpha.length} >>\nstream\n${im.alpha.toString('latin1')}\nendstream`)
+        : 0;
+      const id = add(`<< /Type /XObject /Subtype /Image /Width ${im.w} /Height ${im.h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode${smask ? ` /SMask ${smask} 0 R` : ''} /Length ${im.rgb.length} >>\nstream\n${im.rgb.toString('latin1')}\nendstream`);
+      return `/${im.name} ${id} 0 R`;
+    });
     const fontEntries: string[] = [];
     if (this.usesFont.has('F1')) fontEntries.push(`/F1 ${add('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>')} 0 R`);
     if (this.usesFont.has('F2')) fontEntries.push(`/F2 ${add('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>')} 0 R`);
     objs[catalog - 1] = `<< /Type /Catalog /Pages ${pages} 0 R >>`;
     objs[pages - 1] = `<< /Type /Pages /Kids [${page} 0 R] /Count 1 >>`;
     objs[page - 1] = `<< /Type /Page /Parent ${pages} 0 R /MediaBox [0 0 ${f(w)} ${f(h)}] /Contents ${stream} 0 R ` +
-      `/Resources << /ExtGState << ${gsEntries.join(' ')} >> /Shading << ${shEntries.join(' ')} >> /Font << ${fontEntries.join(' ')} >> >> >>`;
+      `/Resources << /ExtGState << ${gsEntries.join(' ')} >> /Shading << ${shEntries.join(' ')} >> /Font << ${fontEntries.join(' ')} >> /XObject << ${xobjEntries.join(' ')} >> >> >>`;
 
     let out = '%PDF-1.4\n%\xE2\xE3\xCF\xD3\n';
     const offsets: number[] = [];

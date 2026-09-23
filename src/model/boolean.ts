@@ -66,6 +66,18 @@ export function booleanPolygons(op: BoolOp, operands: Operand[]): Polygon[] {
   return fromInt(res.filter((p) => p.length >= 3));
 }
 
+/** Tek operandın dolgu kuralını çözülmüş hali (nonzero, örtüşmesiz). */
+export function normalizeRegion(o: Operand): Polygon[] {
+  return fromInt(normalize(o.polys, o.fillRule));
+}
+
+/** Bölgeyi kırpma maskesiyle kesiştir (maske boşsa sonuç boş). */
+export function clipRegion(region: Polygon[], clip: Operand): Polygon[] {
+  if (!region.length) return [];
+  return fromInt(exec(ClipperLib.ClipType.ctIntersection, toInt(region), normalize(clip.polys, clip.fillRule),
+    ClipperLib.PolyFillType.pftNonZero, ClipperLib.PolyFillType.pftNonZero));
+}
+
 export type JoinType = 'miter' | 'round' | 'square';
 
 /** Kapalı şekli `delta` kadar büyüt (+) / küçült (−). */

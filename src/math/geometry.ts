@@ -65,6 +65,7 @@ export function nodeSubPaths(n: VNode): SubPath[] {
     case 'ellipse': return [ellipseSubPath(n.x + n.width / 2, n.y + n.height / 2, n.width / 2, n.height / 2)];
     case 'line': return [{ closed: false, points: [{ x: n.x1, y: n.y1 }, { x: n.x2, y: n.y2 }] }];
     case 'text': { const b = textBox(n); return [rectSubPath(b.x, b.y, b.w, b.h)]; }
+    case 'image': return [rectSubPath(n.x, n.y, n.width, n.height)];
     case 'group': return [];
   }
 }
@@ -79,6 +80,12 @@ export function nodeBBox(n: VNode, parent: Matrix = { a: 1, b: 0, c: 0, d: 1, e:
       const cb = nodeBBox(ch, m, withStroke);
       if (!isEmptyBBox(cb)) b = unionBBox(b, cb);
     }
+    if (n.clip && !isEmptyBBox(b)) {
+      // Görünen alan = içerik ∩ kırpma
+      const cb = subpathsBBox(n.clip.subpaths.map((sp) => transformSubPath(sp, m)));
+      b = { minX: Math.max(b.minX, cb.minX), minY: Math.max(b.minY, cb.minY), maxX: Math.min(b.maxX, cb.maxX), maxY: Math.min(b.maxY, cb.maxY) };
+      if (isEmptyBBox(b)) return emptyBBox();
+    }
     return b;
   }
   const b = subpathsBBox(nodeSubPaths(n).map((sp) => transformSubPath(sp, m)));
@@ -89,7 +96,12 @@ export function nodeBBox(n: VNode, parent: Matrix = { a: 1, b: 0, c: 0, d: 1, e:
   return b;
 }
 
-/** Node'u verilen matrisle dünya-uzayı poligonlarına düzleştir (grup → tüm yapraklar). */
+/** Grubun kırpma maskesini verilen matrisle poligonlara düzleştir. */
+export function clipPolygons(g: { clip?: { subpaths: SubPath[] } }, m: Matrix, tol = 0.1) {
+  return g.clip ? flattenSubPaths(g.clip.subpaths.map((sp) => transformSubPath(sp, m)), tol) : null;
+}
+
+/** Node'u verilen matrisle dünya-uzayı poligonlarına düzleştir (grup → tüm yapraklar; kırpma ayrıca uygulanmalı). */
 export function nodePolygons(n: VNode, parent: Matrix, tol = 0.1): { polys: { x: number; y: number }[][]; closed: boolean[] } {
   const m = multiply(parent, n.transform);
   if (n.type === 'group') {

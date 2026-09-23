@@ -86,7 +86,7 @@ export function createMcpServer(backend: Backend, opts: McpOptions): McpServer {
   reg('doc_create', 'Yeni boş belge oluştur (mevcut belgenin yerini alır; undo ile geri alınabilir).', {
     title: z.string().optional(), width: z.number().positive().optional(), height: z.number().positive().optional(), ...expected,
   }, async (a) => ({ content: [text(await call('doc_create', a))] }));
-  reg('doc_open', 'Diskten .json (MasVector) veya .svg belge aç. Yol, sunucunun çalışma dizinine görelidir.', { path: z.string() },
+  reg('doc_open', 'Diskten .json (MasVector), .svg, .pdf (vektör içe aktarma) veya görsel (vektörleştirme) aç. Yol, sunucunun çalışma dizinine görelidir.', { path: z.string() },
     async (a) => ({ content: [text(await call('doc_open', a))] }));
   reg('doc_save', 'Belgeyi diske kaydet. Uzantıya göre biçim: .json (varsayılan, kayıpsız), .svg, .png, .pdf. Yol verilmezse otomatik kayıt dosyası.', { path: z.string().optional() },
     async (a) => ({ content: [text(await call('doc_save', a))] }));
@@ -98,6 +98,7 @@ export function createMcpServer(backend: Backend, opts: McpOptions): McpServer {
   reg('doc_export', 'Dışa aktar: svg (metin döner), png (görsel döner), pdf (vektör), json. path verilirse dosyaya da yazar.', {
     format: z.enum(['svg', 'png', 'pdf', 'json']), path: z.string().optional(), frameId: z.string().optional(),
     scale: z.number().positive().max(16).optional().describe('PNG ölçeği (varsayılan 2)'), background: z.boolean().optional(),
+    includeHidden: z.boolean().optional().describe('SVG: gizli katmanları (ör. Referans) dahil et (varsayılan true)'),
   }, async (a) => {
     const r = await call('doc_export', a);
     const meta = { format: a.format, path: r.path, bytes: r.bytes, warnings: r.warnings?.length ? r.warnings : undefined };
@@ -107,6 +108,47 @@ export function createMcpServer(backend: Backend, opts: McpOptions): McpServer {
   }, { readOnlyHint: true });
   reg('doc_info', 'Belge özeti: sürüm, sayfalar, frame\'ler, katmanlar, kılavuzlar, kilit durumu, geçmiş.', {},
     async () => ({ content: [text(await call('doc_info', {}))] }), { readOnlyHint: true });
+
+  // ——— Vektörleştirme (PDF / görsel → vektör)
+  const traceShape = {
+    preset: z.enum(['auto', 'logo', 'illustration', 'lineart', 'photo']).optional().describe('auto: görsel türü kendiliğinden sınıflandırılır'),
+    colors: z.number().int().min(1).max(256).optional().describe('Tam renk sayısı (yoksa otomatik)'),
+    maxColors: z.number().int().min(2).max(256).optional(),
+    palette: z.array(z.string()).optional().describe('Sabit palet (#rrggbb) — kurumsal renklerle birebir eşleşme'),
+    detail: z.number().min(0).max(1).optional().describe('0..1 yüksek = daha çok ayrıntı (küçük parçalar korunur)'),
+    smoothness: z.number().min(0).max(1).optional().describe('0..1 yüksek = daha pürüzsüz eğri, daha az çapa'),
+    background: z.enum(['auto', 'keep', 'remove']).optional().describe('auto: düz arka plan frame arka planı olur'),
+    method: z.enum(['overlap', 'stacked', 'abutting']).optional().describe('overlap (önerilen): bağımsız şekiller, boşluksuz'),
+    refine: z.boolean().optional().describe('Kalite hedefi tutmazsa ayarları kendisi sıkılaştırır (varsayılan true)'),
+  };
+  reg('vectorize_image', 'Raster görseli (PNG/JPEG/WebP/GIF/BMP/TIFF) profesyonel vektöre çevir: OKLab renk nicemleme, renk başına bağımsız şekil, pürüzsüz Bézier, sivri köşe onarımı. Sonuç kaynakla piksel piksel doğrulanır (report.fidelity: pctOff < %0.25 mükemmel, < %1 çok iyi). mode=replace yeni belge (gizli+kilitli "Referans" katmanı + "Vektör" katmanı); mode=merge mevcut belgeye grup olarak yerleştirir (placement ile konum/boyut). Ardından compare_reference ile fark haritasını görün.', {
+    path: z.string().optional().describe('Görsel dosyası (sunucu çalışma dizinine göreli)'),
+    data: z.string().optional().describe('veya base64 / data URI'),
+    mode: z.enum(['replace', 'merge']).optional(),
+    parentId: z.string().optional(),
+    placement: z.object({ x: z.number(), y: z.number(), width: z.number().positive().optional(), height: z.number().positive().optional() }).optional(),
+    keepReference: z.boolean().optional(),
+    name: z.string().optional(),
+    ...traceShape,
+  }, async (a) => {
+    const r = await call('vectorize_image', a);
+    return { content: [text(r)] };
+  });
+  reg('pdf_import', 'PDF\'i vektör olarak içe aktar. Vektör sayfalar kayıpsız gelir (yollar, gradyanlar, kırpmalar, gömülü görseller; metin = glif eğrileri) ve yapı sadeleştirilir (glifler satır başına tek path, gereksiz kırpmalar temizlenir). Taranmış (yalnız görsel içeren) sayfalar otomatik tespit edilip 300 dpi üzerinden izlenir. Her sayfa ayrı frame; her biri poppler render\'ıyla doğrulanır (fidelity). mode=replace yeni belge, append mevcut belgeye frame ekler.', {
+    path: z.string(),
+    pages: z.array(z.number().int().positive()).optional().describe('Sayfa numaraları (1\'den); yoksa tümü'),
+    mode: z.enum(['replace', 'append']).optional(),
+    verify: z.boolean().optional().describe('Poppler render\'ıyla piksel doğrulaması (varsayılan true)'),
+    traceScanned: z.boolean().optional().describe('Taranmış sayfaları izle (varsayılan true)'),
+    password: z.string().optional(),
+    trace: z.object(traceShape).optional().describe('Taranmış sayfalar için izleme ayarları'),
+  }, async (a) => ({ content: [text(await call('pdf_import', a))] }));
+  reg('compare_reference', 'Vektör sonucu kaynak rasterla piksel piksel karşılaştır; metrikler + fark haritası (kırmızı = hatalı piksel) görsel olarak döner. Kaynak: path (dosya) veya frame\'deki kilitli Referans görseli.', {
+    frameId: z.string().optional(), referenceId: z.string().optional(), path: z.string().optional(),
+  }, async (a) => {
+    const r = await call('compare_reference', a);
+    return { content: [text(r.metrics), ...(r.heatmap ? [{ type: 'image' as const, data: r.heatmap, mimeType: 'image/png' }] : [])] };
+  }, { readOnlyHint: true });
 
   // ——— Sorgular
   reg('node_get', 'Bir node\'un tam verisi (geometri, stil, dönüşüm, path noktaları) ve frame-uzayı bbox.', { id: z.string() },

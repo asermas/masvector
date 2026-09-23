@@ -12,6 +12,11 @@ Belge: pages → frames → nodes. Katmanlar frame'in en üstündeki gruplardır
 4. render_preview (grid=50 ile koordinatları gör) → hataları düzelt → tekrar önizle.
 5. doc_save / doc_export.
 
+PDF/görsel → vektör:
+- pdf_import (vektör PDF'ler birebir; taranmışlar izlenir) veya vectorize_image (PNG/JPEG...). Rapordaki fidelity.pctOff'a bakın.
+- compare_reference fark haritasını gösterir; kırmızı bölgeler varsa: daha çok ayrıntı (detail↑), renk (colors/palette), ya da elle düzeltme (node_edit_handles, path_simplify).
+- Kurumsal renkler biliniyorsa palette ile verin: renkler birebir o değerlerde olur.
+
 İpuçları:
 - Organik şekiller için node_add_path + SVG "d" (C/Q/A komutları) kullanın; sonra node_edit_handles ile ince ayar.
 - Delikli/karmaşık siluetler: basit şekiller + boolean_union/subtract/intersect/exclude (sonuç tek path).
@@ -58,5 +63,9 @@ export const OP_DESCRIPTIONS: Record<OpName, string> = {
   add_guide: 'Kılavuz çizgisi ekle (axis x = dikey çizgi x=value; y = yatay). align_to to="guide:<id>" ile kullanılır.',
   remove_guide: 'Kılavuzu sil.',
   align_to: 'Hizala: left|hcenter|right|top|vcenter|bottom; to = "selection" (varsayılan), "frame", bir node id (o sabit kalır) veya "guide:<id>".',
+  node_add_image: `Raster görsel ekle (data URI). ${S}`,
+  clip_create: 'Kırpma maskesi oluştur: maske şekli (varsayılan seçimin en üstündeki) diğer node\'ları kırpar; sonuç maske taşıyan grup.',
+  clip_release: 'Kırpma maskesini çöz: maske ince gri konturlu path olarak gruba geri eklenir.',
+  path_simplify: 'Çapa sayısını azalt: path\'i yeniden uydurarak (köşeler korunur) daha az, düzgün Bézier çapasıyla yeniden yaz. İzleme/PDF içe aktarma sonrası temizlik için.',
   distribute: 'En az 3 node\'u x veya y ekseninde eşit aralıkla dağıt (uçtakiler sabit).',
 };

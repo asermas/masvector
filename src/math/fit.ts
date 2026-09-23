@@ -77,6 +77,25 @@ function reparam(b: Bez, pts: V[], u: number[]): number[] {
   });
 }
 
+/** Döngü/taşma koruması: handle kirişin 1.5 katından uzunsa eğri örnekler arasında dışarı sapabilir. */
+function wild(b: Bez): boolean {
+  const chord = dist(b[0], b[3]);
+  return dist(b[0], b[1]) > 1.5 * chord + 1e-9 || dist(b[3], b[2]) > 1.5 * chord + 1e-9;
+}
+
+/** Kapalı çoklu çizgiyi yay uzunluğuna göre `step` aralıkla yeniden örnekle (köşe noktaları korunur). */
+export function densifyClosed(p: V[], step: number): V[] {
+  const out: V[] = [];
+  const n = p.length;
+  for (let i = 0; i < n; i++) {
+    const a = p[i], b = p[(i + 1) % n];
+    out.push(a);
+    const L = dist(a, b), k = Math.floor(L / step);
+    for (let j = 1; j < k; j++) out.push({ x: a.x + ((b.x - a.x) * j) / k, y: a.y + ((b.y - a.y) * j) / k });
+  }
+  return out;
+}
+
 function fitCubic(pts: V[], t1: V, t2: V, tol: number, out: Bez[], depth = 0): void {
   if (pts.length === 2) {
     const d = dist(pts[0], pts[1]) / 3;
@@ -86,19 +105,59 @@ function fitCubic(pts: V[], t1: V, t2: V, tol: number, out: Bez[], depth = 0): v
   let u = chordParams(pts);
   let b = generate(pts, u, t1, t2);
   let { err, idx } = maxError(pts, b, u);
+  if (wild(b)) err = Math.max(err, tol * 5);
   if (err <= tol) { out.push(b); return; }
   if (err <= tol * 4) {
     for (let k = 0; k < 6; k++) {
       u = reparam(b, pts, u);
       b = generate(pts, u, t1, t2);
       ({ err, idx } = maxError(pts, b, u));
+      if (wild(b)) err = Math.max(err, tol * 5);
       if (err <= tol) { out.push(b); return; }
     }
+  }
+  if (pts.length <= 3) { // bölünemeyecek kadar az nokta: güvenli kübik (kiriş/3 handle)
+    const d = dist(pts[0], pts[pts.length - 1]) / 3;
+    out.push([pts[0], add(pts[0], mul(t1, d)), add(pts[pts.length - 1], mul(t2, d)), pts[pts.length - 1]]);
+    return;
   }
   if (depth > 12) { out.push(b); return; }
   const tc = norm(sub(pts[idx - 1], pts[idx + 1]));
   fitCubic(pts.slice(0, idx + 1), t1, tc, tol, out, depth + 1);
   fitCubic(pts.slice(idx), mul(tc, -1), t2, tol, out, depth + 1);
+}
+
+/**
+ * Pencereli köşe algılama: i noktasında, yay uzunluğu ±W uzaklıktaki noktalara giden kirişler arasındaki açı.
+ * Yumuşatılmış/gürültülü köşeler (dönüş birkaç noktaya yayılmış) böylece tek köşe olarak bulunur; yerel maksimum bastırma.
+ */
+function windowCorners(p: V[], W: number, cornerDeg: number, base: boolean[]): boolean[] {
+  const n = p.length;
+  const seg = p.map((q, i) => dist(q, p[(i + 1) % n]));
+  const total = seg.reduce((a, b) => a + b, 0);
+  if (total < 4 * W) return base;
+  const at = (i: number, d: number): V => { // i'den yay boyunca d kadar (işaretli) ilerle
+    let k = i, rem = Math.abs(d);
+    if (d > 0) { while (rem > seg[k]) { rem -= seg[k]; k = (k + 1) % n; } const a = p[k], b = p[(k + 1) % n]; const t = rem / (seg[k] || 1); return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }; }
+    k = (i - 1 + n) % n;
+    while (rem > seg[k]) { rem -= seg[k]; k = (k - 1 + n) % n; }
+    const a = p[(k + 1) % n], b = p[k]; const t = rem / (seg[k] || 1); return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+  };
+  const ang = p.map((q, i) => {
+    const a = norm(sub(q, at(i, -W))), b = norm(sub(at(i, W), q));
+    return Math.acos(Math.max(-1, Math.min(1, dot(a, b)))) * 180 / Math.PI;
+  });
+  const out = new Array(n).fill(false);
+  for (let i = 0; i < n; i++) {
+    if (ang[i] < cornerDeg) continue;
+    // yerel maksimum (±W yay uzunluğu içinde)
+    let isMax = true, d = 0;
+    for (let k = 1; k < n && d < W && isMax; k++) { d += seg[(i + k - 1) % n]; if (ang[(i + k) % n] > ang[i]) isMax = false; }
+    d = 0;
+    for (let k = 1; k < n && d < W && isMax; k++) { d += seg[(i - k + n) % n]; if (ang[(i - k + n) % n] >= ang[i]) isMax = false; }
+    if (isMax) out[i] = true;
+  }
+  return out;
 }
 
 const isCollinearRun = (pts: V[], tol: number) => {
@@ -111,9 +170,10 @@ const isCollinearRun = (pts: V[], tol: number) => {
  * @param tol  uydurma hatası (birim)
  * @param cornerDeg  bu açıdan keskin dönüşler köşe sayılır
  */
-export function fitClosedPolygon(poly: V[], tol = 0.2, cornerDeg = 32): SubPath {
-  // Tekrarlı/çakışık noktaları at
-  const p = poly.filter((q, i) => dist(q, poly[(i + poly.length - 1) % poly.length]) > 1e-6);
+export function fitClosedPolygon(poly: V[], tol = 0.2, cornerDeg = 32, longSegCorners = true, cornerWindow = 0): SubPath {
+  // Tekrarlı/çakışık noktaları at; izleme kipinde (pencereli köşe) uzun kenarları örnekle ki her koşuda yeterli nokta olsun
+  const p0 = poly.filter((q, i) => dist(q, poly[(i + poly.length - 1) % poly.length]) > 1e-6);
+  const p = cornerWindow > 0 ? densifyClosed(p0, Math.max(tol, cornerWindow / 4)) : p0;
   const n = p.length;
   if (n < 3) return { closed: true, points: p.map((q) => ({ x: q.x, y: q.y })) };
   const cosLim = Math.cos((cornerDeg * Math.PI) / 180);
@@ -125,14 +185,17 @@ export function fitClosedPolygon(poly: V[], tol = 0.2, cornerDeg = 32): SubPath 
   const segLen = p.map((q, i) => dist(q, p[(i + 1) % n]));
   const sorted = [...segLen].sort((a, b) => a - b);
   const median = sorted[Math.floor(n / 2)];
-  const longSeg = (i: number) => segLen[i] > Math.max(8 * median, 12 * tol);
-  const corner = p.map((_, i) => turn(i) < cosLim || longSeg(i) || longSeg((i - 1 + n) % n));
+  const longSeg = (i: number) => longSegCorners && segLen[i] > Math.max(8 * median, 12 * tol);
+  let corner = p.map((_, i) => turn(i) < cosLim || longSeg(i) || longSeg((i - 1 + n) % n));
+  if (cornerWindow > 0) corner = windowCorners(p, cornerWindow, cornerDeg, corner);
   let start = corner.indexOf(true);
   const allSmooth = start < 0;
   if (allSmooth) start = 0;
 
   const order = Array.from({ length: n }, (_, k) => (start + k) % n);
   const cornersAt = order.filter((i) => corner[i] || (allSmooth && (i === start || i === order[Math.floor(n / 2)])));
+  // Tek köşe: döngü kendine kapanan dejenere bir eğri olurdu → karşı noktada pürüzsüz bir bölme ekle
+  if (cornersAt.length === 1) cornersAt.push(order[Math.floor(n / 2)]);
   const beziers: { b: Bez; line: boolean }[] = [];
   for (let c = 0; c < cornersAt.length; c++) {
     const i0 = cornersAt[c], i1 = cornersAt[(c + 1) % cornersAt.length];
@@ -163,4 +226,32 @@ export function fitClosedPolygon(poly: V[], tol = 0.2, cornerDeg = 32): SubPath 
     if (last.in) pts[0].in = last.in;
   }
   return { closed: true, points: pts };
+}
+
+/** Açık polyline'ı çapa+handle yoluna çevir (uçlar ve keskin dönüşler köşe olarak korunur). */
+export function fitOpenPolyline(poly: V[], tol = 0.2, cornerDeg = 32): SubPath {
+  const p = poly.filter((q, i) => i === 0 || dist(q, poly[i - 1]) > 1e-6);
+  const n = p.length;
+  if (n < 3) return { closed: false, points: p.map((q) => ({ x: q.x, y: q.y })) };
+  const cosLim = Math.cos((cornerDeg * Math.PI) / 180);
+  const corners = [0];
+  for (let i = 1; i < n - 1; i++) {
+    const a = norm(sub(p[i], p[i - 1])), b = norm(sub(p[i + 1], p[i]));
+    if (dot(a, b) < cosLim) corners.push(i);
+  }
+  corners.push(n - 1);
+  const r = (v: number) => Math.round(v * 1000) / 1000;
+  const pts: PathPoint[] = [{ x: r(p[0].x), y: r(p[0].y) }];
+  for (let c = 0; c < corners.length - 1; c++) {
+    const run = p.slice(corners[c], corners[c + 1] + 1);
+    if (run.length === 2 || isCollinearRun(run, tol)) { const e = run[run.length - 1]; pts.push({ x: r(e.x), y: r(e.y) }); continue; }
+    const out: Bez[] = [];
+    fitCubic(run, norm(sub(run[1], run[0])), norm(sub(run[run.length - 2], run[run.length - 1])), tol, out);
+    for (const b of out) {
+      const a = pts[pts.length - 1];
+      a.out = { dx: r(b[1].x - b[0].x), dy: r(b[1].y - b[0].y) };
+      pts.push({ x: r(b[3].x), y: r(b[3].y), in: { dx: r(b[2].x - b[3].x), dy: r(b[2].y - b[3].y) } });
+    }
+  }
+  return { closed: false, points: pts };
 }

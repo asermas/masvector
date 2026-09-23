@@ -214,3 +214,13 @@ describe('isabet testi (UI + query_hit ortak)', () => {
     expect(hitTest(f, { x: 5, y: 5 }, 3, true)).toEqual([a.id]);
   });
 });
+
+describe('eğri uydurma kenar durumları', () => {
+  it('tek köşeli kapalı yol çökmez', async () => {
+    const { fitClosedPolygon } = await import('../src/math/fit.js');
+    // damla: tek sivri uç + pürüzsüz gövde
+    const pts = Array.from({ length: 120 }, (_, i) => { const t = (i / 120) * 2 * Math.PI; return { x: 100 * Math.sin(t / 2) ** 3 * Math.cos(t) + 200, y: 100 * Math.sin(t / 2) ** 3 * Math.sin(t) + 200 }; });
+    const r = fitClosedPolygon(pts, 0.5, 30, false);
+    expect(r.points.length).toBeGreaterThanOrEqual(3);
+  });
+});

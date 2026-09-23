@@ -1,4 +1,5 @@
-import { createCanvas } from '@napi-rs/canvas';
+import { createCanvas, type Canvas } from '@napi-rs/canvas';
+import { readImageSync } from '@neplex/vectorizer';
 import type { VDocument } from '../common/types.js';
 import { findFrame } from '../model/scene.js';
 import { drawFrame, type Ctx } from './draw.js';
@@ -17,20 +18,64 @@ export interface PngOptions {
   grid?: number;
 }
 
+export interface DecodedImage { width: number; height: number; rgba: Uint8ClampedArray; canvas: Canvas }
+const imageCache = new Map<string, DecodedImage | null>();
+
+/** Kodlanmış görseli (PNG/JPEG/WebP/GIF/BMP/TIFF) senkron RGBA'ya çöz. */
+export function decodeImageBuffer(buf: Buffer): DecodedImage | null {
+  try {
+    const d = readImageSync(buf);
+    if (!d.width || !d.height) return null;
+    const rgba = new Uint8ClampedArray(d.pixels.buffer, d.pixels.byteOffset, d.pixels.length);
+    const canvas = createCanvas(d.width, d.height);
+    const ctx = canvas.getContext('2d');
+    const id = ctx.createImageData(d.width, d.height);
+    id.data.set(rgba);
+    ctx.putImageData(id, 0, 0);
+    return { width: d.width, height: d.height, rgba, canvas };
+  } catch { return null; }
+}
+
+/** data URI'yi senkron çöz — sonuç önbelleklenir. (napi `Image.src` çözümü asenkron olduğundan kullanılmaz.) */
+export function nodeImage(href: string): DecodedImage | null {
+  let img = imageCache.get(href);
+  if (img !== undefined) return img;
+  const m = /^data:[^;,]+(;base64)?,(.*)$/s.exec(href);
+  img = m ? decodeImageBuffer(m[1] ? Buffer.from(m[2], 'base64') : Buffer.from(decodeURIComponent(m[2]))) : null;
+  if (imageCache.size > 64) imageCache.delete(imageCache.keys().next().value!);
+  imageCache.set(href, img);
+  return img;
+}
+
 /** Headless PNG render (ajant önizlemesi ve export). */
 export function renderPNG(doc: VDocument, o: PngOptions = {}): { png: Buffer; width: number; height: number; scale: number } {
+  const r = renderCanvas(doc, o);
+  return { png: r.canvas.toBuffer('image/png'), width: r.width, height: r.height, scale: r.scale };
+}
+
+/** Belgeyi RGBA piksellere render et (karşılaştırma için). `width/height` verilirse tam o boyutta. */
+export function renderRGBA(doc: VDocument, o: PngOptions & { width?: number; height?: number } = {}) {
+  const r = renderCanvas(doc, o);
+  const ctx = r.canvas.getContext('2d');
+  return { rgba: ctx.getImageData(0, 0, r.width, r.height).data, width: r.width, height: r.height, scale: r.scale };
+}
+
+function renderCanvas(doc: VDocument, o: PngOptions & { width?: number; height?: number } = {}) {
   const { frame } = findFrame(doc, o.frameId);
   const r = o.region ?? { x: 0, y: 0, width: frame.w, height: frame.h };
   if (r.width <= 0 || r.height <= 0) throw new VectorError('INVALID_ARGUMENT', 'Bölge boyutu pozitif olmalı');
   let s = o.scale ?? 1;
   if (o.maxSize) s = Math.min(o.maxSize / r.width, o.maxSize / r.height);
-  const W = Math.max(1, Math.round(r.width * s)), H = Math.max(1, Math.round(r.height * s));
+  let W = Math.max(1, Math.round(r.width * s)), H = Math.max(1, Math.round(r.height * s));
+  let sx = s, sy = s;
+  if (o.width && o.height) { W = o.width; H = o.height; sx = W / r.width; sy = H / r.height; s = Math.sqrt(sx * sy); }
   if (W * H > 64e6) throw new VectorError('INVALID_ARGUMENT', `Çıktı çok büyük (${W}×${H})`);
   const canvas = createCanvas(W, H);
   const ctx = canvas.getContext('2d') as unknown as Ctx;
-  const view = multiply(scale(s), translate(-r.x, -r.y));
+  const view = multiply(scale(sx, sy), translate(-r.x, -r.y));
   drawFrame(ctx, frame, view, {
     width: W, height: H, background: o.background,
+    getImage: (href) => (nodeImage(href)?.canvas ?? null) as unknown as CanvasImageSource | null,
     createLayer: (w, h) => { const c = createCanvas(w, h); return { canvas: c, ctx: c.getContext('2d') as unknown as Ctx }; },
   });
   if (o.grid && o.grid > 0) {
@@ -52,5 +97,5 @@ export function renderPNG(doc: VDocument, o: PngOptions = {}): { png: Buffer; wi
     }
     ctx.restore();
   }
-  return { png: canvas.toBuffer('image/png'), width: W, height: H, scale: s };
+  return { canvas, width: W, height: H, scale: s };
 }

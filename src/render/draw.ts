@@ -12,6 +12,8 @@ export interface DrawOptions {
   /** Hedef tuval piksel boyutu (katman için). */
   width: number;
   height: number;
+  /** data URI → çizilebilir görsel (henüz yüklenmediyse null; tarayıcı yükleyince yeniden çizer). */
+  getImage?: (href: string) => CanvasImageSource | null;
 }
 
 const COMPOSITE: Record<string, string> = { normal: 'source-over' };
@@ -67,13 +69,21 @@ function cssFilter(style: Style, viewScale: number): string {
 
 const setM = (ctx: Ctx, m: Matrix) => ctx.setTransform(m.a, m.b, m.c, m.d, m.e, m.f);
 
-function drawLeaf(ctx: Ctx, n: Exclude<VNode, { type: 'group' }>, m: Matrix, alpha: number) {
+function drawLeaf(ctx: Ctx, n: Exclude<VNode, { type: 'group' }>, m: Matrix, alpha: number, opts: DrawOptions) {
   const s = n.style;
   setM(ctx, m);
   ctx.globalCompositeOperation = (COMPOSITE[s.blendMode] ?? s.blendMode) as GlobalCompositeOperation;
   const vs = meanScale(m);
   const f = cssFilter(s, vs);
   if ('filter' in ctx) (ctx as any).filter = f;
+
+  if (n.type === 'image') {
+    const img = opts.getImage?.(n.href);
+    ctx.globalAlpha = alpha * s.opacity;
+    if (img) { ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high'; ctx.drawImage(img, n.x, n.y, n.width, n.height); }
+    else { ctx.fillStyle = 'rgba(128,128,128,.25)'; ctx.fillRect(n.x, n.y, n.width, n.height); }
+    return;
+  }
 
   if (n.type === 'text') {
     ctx.font = `${n.fontWeight ?? 'normal'} ${n.fontSize}px ${n.fontFamily}, ${FONT_FALLBACK}`;
@@ -116,10 +126,24 @@ export function drawNode(ctx: Ctx, n: VNode, parent: Matrix, opts: DrawOptions, 
   const m = multiply(parent, n.transform);
   if (n.type !== 'group') {
     ctx.save();
-    drawLeaf(ctx, n, m, alpha);
+    drawLeaf(ctx, n, m, alpha, opts);
     ctx.restore();
     return;
   }
+  if (n.clip) {
+    // Kırpma: maskeyi grup uzayında izle, çocukları kırpılmış bağlamda çiz
+    ctx.save();
+    setM(ctx, m);
+    tracePath(ctx, n.clip.subpaths);
+    ctx.clip(n.clip.rule);
+    drawGroupContent(ctx, n, m, opts, alpha);
+    ctx.restore();
+    return;
+  }
+  drawGroupContent(ctx, n, m, opts, alpha);
+}
+
+function drawGroupContent(ctx: Ctx, n: Extract<VNode, { type: 'group' }>, m: Matrix, opts: DrawOptions, alpha: number) {
   const s = n.style;
   const needsLayer = s.opacity < 1 || s.blendMode !== 'normal' || s.filters.length > 0;
   if (needsLayer && opts.createLayer) {

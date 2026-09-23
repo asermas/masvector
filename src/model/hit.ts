@@ -1,6 +1,6 @@
 import type { BBox, Frame, Point } from '../common/types.js';
 import { crossingCount, distToPolyline, windingNumber } from '../math/bezier.js';
-import { bboxIntersects, nodeBBox, nodePolygons } from '../math/geometry.js';
+import { bboxIntersects, clipPolygons, nodeBBox, nodePolygons } from '../math/geometry.js';
 import { ancestorsMatrix, walk } from './scene.js';
 
 /**
@@ -13,9 +13,21 @@ export function hitTest(frame: Frame, p: Point, tol = 3, deep = false): string[]
   for (const w of walk(frame.nodes)) {
     const n = w.node;
     if (n.type === 'group' || !n.visible || w.ancestors.some((g) => !g.visible)) continue;
-    const { polys, closed } = nodePolygons(n, ancestorsMatrix(w.ancestors));
+    const A = ancestorsMatrix(w.ancestors);
+    const bb = nodeBBox(n, A, true);
+    if (p.x < bb.minX - tol || p.x > bb.maxX + tol || p.y < bb.minY - tol || p.y > bb.maxY + tol) continue;
+    const { polys, closed } = nodePolygons(n, A);
     const closedPolys = polys.filter((_, i) => closed[i]);
-    const filled = n.type === 'text' || (n.type !== 'line' && n.style.fill !== 'none');
+    // Atalardaki kırpma maskelerinin dışında kalan nokta görünmez → isabet yok
+    let clipped = false;
+    for (let i = 0; i < w.ancestors.length && !clipped; i++) {
+      const g = w.ancestors[i];
+      if (!g.clip) continue;
+      const cp = clipPolygons(g, ancestorsMatrix(w.ancestors.slice(0, i + 1)));
+      if (cp && (g.clip.rule === 'evenodd' ? crossingCount(cp, p) % 2 === 0 : windingNumber(cp, p) === 0)) clipped = true;
+    }
+    if (clipped) continue;
+    const filled = n.type === 'text' || n.type === 'image' || (n.type !== 'line' && n.style.fill !== 'none');
     const even = n.type === 'path' && n.fillRule === 'evenodd';
     const inside = filled && closedPolys.length > 0 &&
       (even ? crossingCount(closedPolys, p) % 2 === 1 : windingNumber(closedPolys, p) !== 0);

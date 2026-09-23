@@ -124,6 +124,21 @@ export const OP_SCHEMAS = {
     align: z.enum(['left', 'hcenter', 'right', 'top', 'vcenter', 'bottom']),
     to: z.string().optional().describe('"selection" (varsayılan), "frame", bir node id veya "guide:<id>"'),
   }),
+  node_add_image: z.object({
+    ...common, x: num, y: num, width: num.positive(), height: num.positive(),
+    href: z.string().describe('data:image/png;base64,... (dosyadan eklemek için doc_import/vectorize_image)'),
+  }),
+  clip_create: z.object({
+    ids: z.array(z.string()).min(2).describe('Maske + kırpılacak node\'lar'),
+    maskId: z.string().optional().describe('Maske şekli; yoksa seçimin en üstteki node\'u'),
+    name: z.string().optional(),
+  }),
+  clip_release: z.object({ id: z.string().describe('Kırpma grubu') }),
+  path_simplify: z.object({
+    ids: z.array(z.string()).min(1).describe('Path veya gruplar (gruplarda tüm alt path\'ler)'),
+    tolerance: num.positive().optional().describe('İzin verilen sapma (birim, varsayılan 0.5)'),
+    cornerAngle: num.min(1).max(179).optional().describe('Bu açıdan keskin dönüşler köşe olarak korunur (varsayılan 32°)'),
+  }),
   distribute: z.object({ ids: z.array(z.string()).min(3), axis: z.enum(['x', 'y']) }),
 } as const;
 

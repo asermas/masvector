@@ -1,4 +1,4 @@
-import { promises as fs } from 'node:fs';
+import { promises as fs, readFileSync } from 'node:fs';
 import path from 'node:path';
 import type { VDocument, VNode } from '../common/types.js';
 import { VectorError, invalid } from '../common/errors.js';
@@ -16,6 +16,13 @@ import { nodePolygons } from '../math/geometry.js';
 import { bboxIntersects } from '../math/geometry.js';
 import { isEmptyBBox, unionBBox } from '../math/bezier.js';
 import { hitTest } from '../model/hit.js';
+import { IMAGE_EXT, isPdf, pdfToDoc, vectorizeImageAsGroup, vectorizeImageToDoc, type VectorizeImageOptions } from '../vectorize/index.js';
+import { compareDocument } from '../vectorize/compare.js';
+import { decodeImageBuffer, nodeImage } from '../render/png.js';
+import { combineMaskImages } from '../render/image-ops.js';
+import { cleanupFrame } from '../serialization/cleanup.js';
+import { findPage } from '../model/scene.js';
+import type { ImageNode } from '../common/types.js';
 
 export interface CallContext { agentId: string }
 
@@ -223,11 +230,18 @@ export class DocumentEngine {
 
   async docOpen(ctx: CallContext, p: string) {
     const abs = this.resolvePath(p);
+    if (isPdf(abs)) return this.importPdf(ctx, { path: p, mode: 'replace' });
+    if (IMAGE_EXT.test(abs)) return this.vectorizeImage(ctx, { path: p, mode: 'replace' });
     let text: string;
     try { text = await fs.readFile(abs, 'utf8'); } catch (e) { throw new VectorError('IO', `Okunamadı: ${abs} (${(e as Error).message})`); }
     const isSvg = abs.toLowerCase().endsWith('.svg') || text.trimStart().startsWith('<');
     let warnings: string[] = [];
-    const loaded = isSvg ? (() => { const r = importSVG(text, { title: path.basename(abs) }); warnings = r.warnings; return r.doc; })() : parseJSON(text);
+    const loaded = isSvg ? (() => {
+      const r = importSVG(text, { title: path.basename(abs), combineMask: combineMaskImages, resolveHref: (h) => this.resolveHref(h, path.dirname(abs)) });
+      warnings = r.warnings;
+      cleanupFrame(r.frame);
+      return r.doc;
+    })() : parseJSON(text);
     return this.mutate(ctx, 'doc_open', () => {
       const v = this.doc.version;
       this.doc = loaded;
@@ -301,10 +315,10 @@ export class DocumentEngine {
     });
   }
 
-  async docExport(a: { format: 'svg' | 'png' | 'pdf' | 'json'; path?: string; frameId?: string; scale?: number; background?: boolean }) {
+  async docExport(a: { format: 'svg' | 'png' | 'pdf' | 'json'; path?: string; frameId?: string; scale?: number; background?: boolean; includeHidden?: boolean }) {
     let data: string | Buffer, warnings: string[] = [];
     switch (a.format) {
-      case 'svg': data = documentToSVG(this.doc, a.frameId, { background: a.background }); break;
+      case 'svg': data = documentToSVG(this.doc, a.frameId, { background: a.background, skipHidden: a.includeHidden === false }); break;
       case 'json': data = serializeJSON(this.doc); break;
       case 'png': data = renderPNG(this.doc, { frameId: a.frameId, scale: a.scale ?? 2, background: a.background }).png; break;
       case 'pdf': { const r = documentToPDF(this.doc, a.frameId); data = r.pdf; warnings = r.warnings; break; }
@@ -317,6 +331,104 @@ export class DocumentEngine {
       await fs.writeFile(written, data);
     }
     return { data, path: written, warnings, bytes: typeof data === 'string' ? Buffer.byteLength(data) : data.length };
+  }
+
+  // ———————————————————————— vektörleştirme
+
+  /** Harici görsel bağlantısını (SVG içinden) çalışma dizini içinde çöz. */
+  private resolveHref(href: string, baseDir: string): string | null {
+    if (/^[a-z]+:/i.test(href) && !href.startsWith('file:')) return null;
+    try {
+      const abs = path.resolve(baseDir, decodeURIComponent(href.replace(/^file:\/\//, '')));
+      this.resolvePath(abs);
+      const buf = readFileSyncSafe(abs);
+      if (!buf) return null;
+      const ext = path.extname(abs).slice(1).toLowerCase().replace('jpg', 'jpeg');
+      return `data:image/${ext || 'png'};base64,${buf.toString('base64')}`;
+    } catch { return null; }
+  }
+
+  private async readInput(p: { path?: string; data?: string }): Promise<{ buf: Buffer; name: string; file?: string }> {
+    if (p.data) {
+      const b64 = p.data.replace(/^data:[^;,]+;base64,/, '');
+      return { buf: Buffer.from(b64, 'base64'), name: 'yüklenen' };
+    }
+    if (!p.path) throw invalid('path veya data (base64) gerekli');
+    const abs = this.resolvePath(p.path);
+    try { return { buf: await fs.readFile(abs), name: path.basename(abs, path.extname(abs)), file: abs }; }
+    catch (e) { throw new VectorError('IO', `Okunamadı: ${abs} (${(e as Error).message})`); }
+  }
+
+  /** Raster görseli vektöre çevir. replace: yeni belge (Referans+Vektör katmanı); merge: mevcut belgeye grup. */
+  async vectorizeImage(ctx: CallContext, p: VectorizeImageOptions & { path?: string; data?: string; mode?: 'replace' | 'merge'; parentId?: string; placement?: { x: number; y: number; width?: number; height?: number }; expectedVersion?: number }) {
+    this.assertCanWrite(ctx, p.expectedVersion);
+    const { buf, name, file } = await this.readInput(p);
+    if (isPdf(file ?? '', buf)) {
+      if (!file) throw invalid('PDF için path verin');
+      return this.importPdf(ctx, { path: p.path!, mode: p.mode === 'merge' ? 'append' : 'replace' });
+    }
+    if (p.mode === 'merge') {
+      const { group, report } = await vectorizeImageAsGroup(buf, { ...p, name: p.name ?? `${name} (vektör)` });
+      return this.mutate(ctx, 'vectorize_image(merge)', (d) => {
+        const target = p.parentId ? containerChildren(d, p.parentId) : { list: findFrame(d).frame.nodes };
+        target.list.push(group);
+        return { ...summarize(d, group.id), report };
+      }, p.expectedVersion);
+    }
+    const { doc, report, vectorGroupId, referenceId } = await vectorizeImageToDoc(buf, { ...p, title: p.name ?? name });
+    return this.mutate(ctx, 'vectorize_image', () => {
+      const v = this.doc.version;
+      this.doc = doc; this.doc.version = v;
+      return { vectorGroupId, referenceId, frameId: doc.pages[0].frames[0].id, report };
+    }, p.expectedVersion);
+  }
+
+  /** PDF içe aktar (vektör sayfalar birebir; taranmış sayfalar izlenir). replace: yeni belge; append: frame olarak ekle. */
+  async importPdf(ctx: CallContext, p: { path: string; pages?: number[]; mode?: 'replace' | 'append'; verify?: boolean; traceScanned?: boolean; password?: string; trace?: VectorizeImageOptions; expectedVersion?: number }) {
+    this.assertCanWrite(ctx, p.expectedVersion);
+    if (!p.path) throw invalid('pdf_import: path gerekli');
+    const abs = this.resolvePath(p.path);
+    const { doc, info, reports } = await pdfToDoc(abs, { pages: p.pages, verifyDpi: p.verify === false ? 0 : 144, password: p.password, traceScanned: p.traceScanned, trace: p.trace });
+    return this.mutate(ctx, 'pdf_import', (d) => {
+      if (p.mode === 'append') {
+        const page = findPage(d);
+        let x = Math.max(0, ...page.frames.map((f) => f.x + f.w)) + 80;
+        for (const f of doc.pages[0].frames) { f.x = x; x += f.w + 40; page.frames.push(f); }
+      } else {
+        const v = this.doc.version;
+        this.doc = doc; this.doc.version = v;
+      }
+      return { pages: info.pages, imported: reports.map((r) => ({ page: r.page, frameId: r.frameId, kind: r.kind, fidelity: r.fidelity, cleanup: r.cleanup, stats: r.stats, palette: r.palette, warnings: r.warnings })) };
+    }, p.expectedVersion);
+  }
+
+  /**
+   * Vektör sonucu kaynakla karşılaştır. Kaynak: `path` (görsel dosyası) ya da frame'deki kilitli referans görseli
+   * (vectorize_image'ın eklediği "Referans" katmanı). Referans render dışı tutulur.
+   */
+  async compareReference(p: { frameId?: string; referenceId?: string; path?: string; heatmap?: boolean }) {
+    const { frame } = findFrame(this.doc, p.frameId);
+    let ref: { rgba: Uint8ClampedArray; width: number; height: number } | null = null;
+    const hide: string[] = [];
+    if (p.path) {
+      const abs = this.resolvePath(p.path);
+      const d = decodeImageBuffer(await fs.readFile(abs));
+      if (!d) throw invalid('Referans görsel çözülemedi');
+      ref = { rgba: d.rgba, width: d.width, height: d.height };
+    } else {
+      let img: ImageNode | undefined;
+      for (const w of walk(frame.nodes)) {
+        const n = w.node;
+        if (n.type === 'image' && (p.referenceId ? n.id === p.referenceId : (w.ancestors.some((a) => a.locked) || n.locked))) { img = n; hide.push(...w.ancestors.map((a) => a.id), n.id); break; }
+      }
+      if (!img) throw invalid('Karşılaştırılacak referans görsel yok: path verin veya referenceId belirtin');
+      const d = nodeImage(img.href);
+      if (!d) throw invalid('Referans görsel çözülemedi');
+      ref = { rgba: d.rgba, width: d.width, height: d.height };
+      // referansı yalnız gizlemek yetmez: yalnız görsel değil, onun katmanı da dışarıda kalsın
+    }
+    const c = compareDocument(this.doc, ref, { frameId: frame.id, hide: hide.length ? hide.slice(-1) : undefined });
+    return { metrics: c.metrics, heatmap: p.heatmap === false ? undefined : c.heatmap().toString('base64') };
   }
 
   // ———————————————————————— sorgular (salt okunur)
@@ -424,6 +536,10 @@ export class DocumentEngine {
       case 'doc_open': return this.docOpen(ctx, p.path);
       case 'doc_save': return this.docSave(p.path);
       case 'doc_import': {
+        if (p.path && (isPdf(p.path) || IMAGE_EXT.test(p.path))) {
+          const merge = p.mode === 'merge';
+          return isPdf(p.path) ? this.importPdf(ctx, { ...p, mode: merge ? 'append' : 'replace' }) : this.vectorizeImage(ctx, { ...p, mode: merge ? 'merge' : 'replace' });
+        }
         let content: string = p.content;
         if (!content && p.path) content = await fs.readFile(this.resolvePath(p.path), 'utf8');
         if (!content) throw invalid('doc_import: content veya path gerekli');
@@ -434,6 +550,9 @@ export class DocumentEngine {
         const r = await this.docExport(p);
         return { ...r, data: typeof r.data === 'string' ? r.data : r.data.toString('base64'), encoding: typeof r.data === 'string' ? 'utf8' : 'base64' };
       }
+      case 'vectorize_image': return this.vectorizeImage(ctx, p);
+      case 'pdf_import': return this.importPdf(ctx, p);
+      case 'compare_reference': return this.compareReference(p);
       case 'doc_get': return this.doc;
       case 'doc_info': return this.info();
       case 'node_get': return this.nodeGet(p.id);
@@ -451,6 +570,9 @@ export class DocumentEngine {
     }
   }
 }
+
+function readFileSyncSafe(p: string): Buffer | null { try { return readFileSync(p); } catch { return null; } }
+
 
 const r3 = (n: number) => Math.round(n * 1000) / 1000;
 const rect = (b: { minX: number; minY: number; maxX: number; maxY: number }) => ({ x: r3(b.minX), y: r3(b.minY), width: r3(b.maxX - b.minX), height: r3(b.maxY - b.minY) });
