@@ -156,3 +156,61 @@ describe('operasyonlar', () => {
     for (const pt of n.subpaths[0].points) { expect(pt.x % 8).toBe(0); expect(pt.y % 8).toBe(0); }
   });
 });
+
+describe('eğri uydurma (boolean sonrası)', () => {
+  it('iki dairenin birleşimi az sayıda kübik çapa ile, alan korunarak döner', async () => {
+    const { fitClosedPolygon } = await import('../src/math/fit.js');
+    const d = fresh2();
+    const a: any = applyOp(d, 'node_add_ellipse', { x: 0, y: 0, width: 100, height: 100 });
+    const b: any = applyOp(d, 'node_add_ellipse', { x: 60, y: 0, width: 100, height: 100 });
+    const u: any = applyOp(d, 'boolean_union', { ids: [a.id, b.id] });
+    const n: any = mustLocate(d, u.id).node;
+    expect(n.subpaths).toHaveLength(1);
+    const pts = n.subpaths[0].points;
+    expect(pts.length).toBeLessThan(20);
+    expect(pts.some((p: any) => p.out)).toBe(true);
+    // analitik alan: 2πr² − mercek alanı (r=50, merkez uzaklığı 60)
+    const r = 50, dd = 60, lens = 2 * r * r * Math.acos(dd / (2 * r)) - (dd / 2) * Math.sqrt(4 * r * r - dd * dd);
+    const [poly] = flattenSubPaths(n.subpaths, 0.01);
+    expect(Math.abs(Math.abs(signedArea(poly)) - (2 * Math.PI * r * r - lens)) / (2 * Math.PI * r * r - lens)).toBeLessThan(0.002);
+    // iki kesişim köşesi korunmalı (handle'lar simetrik değil)
+    void fitClosedPolygon;
+  });
+  it('dikdörtgen kenarları düz kalır (handle üretilmez)', () => {
+    const d = fresh2();
+    const a: any = applyOp(d, 'node_add_rect', { x: 0, y: 0, width: 50, height: 50 });
+    const b: any = applyOp(d, 'node_add_rect', { x: 25, y: 25, width: 50, height: 50 });
+    const u: any = applyOp(d, 'boolean_union', { ids: [a.id, b.id] });
+    const pts = (mustLocate(d, u.id).node as any).subpaths[0].points;
+    expect(pts).toHaveLength(8);
+    expect(pts.every((p: any) => !p.in && !p.out)).toBe(true);
+  });
+});
+function fresh2() { return createDocument('fit', 400, 400); }
+
+describe('isabet testi (UI + query_hit ortak)', () => {
+  it('üstteki node önce gelir; dolgusuz şeklin içi isabet etmez, konturu eder; evenodd deliği boştur', async () => {
+    const { hitTest, marqueeSelect } = await import('../src/model/hit.js');
+    const d = fresh2();
+    const a: any = applyOp(d, 'node_add_rect', { x: 0, y: 0, width: 100, height: 100 });
+    const b: any = applyOp(d, 'node_add_ellipse', { x: 50, y: 50, width: 100, height: 100 });
+    const ring: any = applyOp(d, 'node_add_rect', { x: 200, y: 0, width: 100, height: 100, style: { fill: 'none', stroke: '#000', strokeWidth: 4 } });
+    const donut: any = applyOp(d, 'node_add_path', { d: 'M0 200 h100 v100 h-100 Z M25 225 h50 v50 h-50 Z', fillRule: 'evenodd' });
+    const f = d.pages[0].frames[0];
+    expect(hitTest(f, { x: 75, y: 75 })).toEqual([b.id, a.id]);
+    expect(hitTest(f, { x: 250, y: 50 })).toEqual([]);
+    expect(hitTest(f, { x: 201, y: 50 })).toEqual([ring.id]);
+    expect(hitTest(f, { x: 50, y: 250 })).toEqual([]);
+    expect(hitTest(f, { x: 10, y: 210 })).toEqual([donut.id]);
+    expect(marqueeSelect(f, { minX: -1, minY: -1, maxX: 101, maxY: 101 })).toEqual([a.id]);
+  });
+  it('grup içindeki yaprak tıklanınca grup seçilir (deep=false)', async () => {
+    const { hitTest } = await import('../src/model/hit.js');
+    const d = fresh2();
+    const a: any = applyOp(d, 'node_add_rect', { x: 0, y: 0, width: 10, height: 10 });
+    const g: any = applyOp(d, 'group', { ids: [a.id] });
+    const f = d.pages[0].frames[0];
+    expect(hitTest(f, { x: 5, y: 5 })).toEqual([g.id]);
+    expect(hitTest(f, { x: 5, y: 5 }, 3, true)).toEqual([a.id]);
+  });
+});

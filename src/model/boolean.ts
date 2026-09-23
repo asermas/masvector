@@ -2,6 +2,7 @@ import ClipperLib from 'clipper-lib';
 import type { Polygon, SubPath } from '../common/types.js';
 import { VectorError } from '../common/errors.js';
 import { signedArea } from '../math/bezier.js';
+import { fitClosedPolygon } from '../math/fit.js';
 
 /** Clipper tamsayı çalışır; 1/1000 birim hassasiyet. */
 const SCALE = 1000;
@@ -99,7 +100,9 @@ function joinType(j: JoinType) {
   return j === 'round' ? ClipperLib.JoinType.jtRound : j === 'square' ? ClipperLib.JoinType.jtSquare : ClipperLib.JoinType.jtMiter;
 }
 
-export function polygonsToSubPaths(polys: Polygon[]): SubPath[] {
+/** Sonuç poligonlarını path'e çevir; `fit` açıkken düzleşmiş eğriler yeniden kübik Bézier olur. */
+export function polygonsToSubPaths(polys: Polygon[], fit = true, tol = 0.2): SubPath[] {
+  if (fit) return polys.map((p) => fitClosedPolygon(p, tol));
   return polys.map((p) => ({ closed: true, points: p.map((q) => ({ x: +q.x.toFixed(3), y: +q.y.toFixed(3) })) }));
 }
 

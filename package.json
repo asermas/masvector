@@ -12,7 +12,8 @@
     "doc-server": "tsx src/bin/doc-server.ts",
     "mcp-stdio": "tsx src/bin/mcp-stdio.ts",
     "mcp-http": "tsx src/bin/mcp-http.ts",
-    "dev": "node scripts/build-ui.mjs && electron ."
+    "dev": "node scripts/build-ui.mjs && electron .",
+    "demo": "tsx scripts/demo-agent.ts"
   },
   "license": "MIT",
   "dependencies": {
@@ -28,5 +29,13 @@
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11"
+  },
+  "bin": {
+    "masvector-doc-server": "dist/bin/doc-server.js",
+    "masvector-mcp-stdio": "dist/bin/mcp-stdio.js",
+    "masvector-mcp-http": "dist/bin/mcp-http.js"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
