@@ -15,6 +15,8 @@ export interface DrawOptions {
 }
 
 const COMPOSITE: Record<string, string> = { normal: 'source-over' };
+/** Belgede istenen font yoksa Türkçe glifleri (ı, ş, ğ) kapsayan yaygın fontlara düş. */
+const FONT_FALLBACK = '"Noto Sans", "DejaVu Sans", "Segoe UI", Roboto, Arial, sans-serif';
 
 function tracePath(ctx: Ctx, sps: SubPath[]) {
   ctx.beginPath();
@@ -74,7 +76,7 @@ function drawLeaf(ctx: Ctx, n: Exclude<VNode, { type: 'group' }>, m: Matrix, alp
   if ('filter' in ctx) (ctx as any).filter = f;
 
   if (n.type === 'text') {
-    ctx.font = `${n.fontWeight ?? 'normal'} ${n.fontSize}px ${n.fontFamily}`;
+    ctx.font = `${n.fontWeight ?? 'normal'} ${n.fontSize}px ${n.fontFamily}, ${FONT_FALLBACK}`;
     ctx.textAlign = n.textAnchor === 'middle' ? 'center' : n.textAnchor === 'end' ? 'right' : 'left';
     ctx.textBaseline = 'alphabetic';
     const fill = toCanvasPaint(ctx, s.fill);

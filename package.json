@@ -5,9 +5,9 @@
   "type": "module",
   "main": "src/ui/electron/main.cjs",
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/build-ui.mjs",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.renderer.json && node scripts/build-ui.mjs",
     "build:ui": "node scripts/build-ui.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.renderer.json",
     "test": "vitest run",
     "doc-server": "tsx src/bin/doc-server.ts",
     "mcp-stdio": "tsx src/bin/mcp-stdio.ts",
