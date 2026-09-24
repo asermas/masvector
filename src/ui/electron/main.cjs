@@ -1,7 +1,7 @@
 // Electron ana süreci. UI yalnız bir render istemcisidir: belge Document Server'dadır.
 // Sunucu çalışmıyorsa AYRI bir süreç olarak başlatılır (3 süreçli mimari korunur).
-const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require('electron');
-const { spawn } = require('node:child_process');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, shell } = require('electron');
+const { execFile, spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -29,7 +29,7 @@ async function ensureServer() {
     : ['--import', 'tsx', path.join(ROOT, 'src', 'bin', 'doc-server.ts')];
   args.push('--port', port, '--workspace', WORKSPACE, '--allow-any-path');
   child = spawn(process.execPath, args, {
-    cwd: ROOT, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'inherit', 'inherit'],
+    cwd: ROOT, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'inherit', 'inherit'], windowsHide: true,
   });
   child.on('exit', (code) => { child = null; if (code) console.error(`[electron] doc-server çıktı: ${code}`); });
   for (let i = 0; i < 60; i++) { if (await healthy()) return 'başlatıldı'; await new Promise((r) => setTimeout(r, 150)); }
@@ -44,6 +44,97 @@ async function rpc(method, params) {
   const b = await r.json();
   if (!b.ok) throw new Error(b.error?.message ?? `HTTP ${r.status}`);
   return b.result;
+}
+
+// ── Claude / MCP bağlantısı ─────────────────────────────────────────────────────────────────
+// Ajan, uygulamanın kendi çalıştırılabilir dosyasını ELECTRON_RUN_AS_NODE=1 ile düz Node olarak başlatır
+// (ayrı Node kurulumu gerekmez). --ensure-server: masaüstü uygulaması kapalıysa belge sunucusunu arka planda açar.
+function mcpStdio() {
+  const script = path.join(ROOT, 'dist', 'bin', 'mcp-stdio.js');
+  if (process.env.APPIMAGE || !fs.existsSync(script)) return null; // AppImage bağlama yolu her açılışta değişir
+  return { command: process.execPath, args: [script, '--server', SERVER, '--ensure-server'], env: { ELECTRON_RUN_AS_NODE: '1' } };
+}
+const quote = (a) => (/[\s"]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a);
+
+/** Claude Desktop yapılandırma dosyaları (normal kurulum + Microsoft Store/MSIX sanallaştırılmış yolu). */
+function claudeDesktopConfigs() {
+  const out = [path.join(app.getPath('appData'), 'Claude', 'claude_desktop_config.json')];
+  if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
+    const pk = path.join(process.env.LOCALAPPDATA, 'Packages');
+    try {
+      for (const d of fs.readdirSync(pk)) if (/^Claude_/i.test(d)) out.push(path.join(pk, d, 'LocalCache', 'Roaming', 'Claude', 'claude_desktop_config.json'));
+    } catch { /* yok */ }
+  }
+  return out;
+}
+
+function addToClaudeDesktop(entry) {
+  const all = claudeDesktopConfigs();
+  // Claude Desktop'un kurulu olduğu (dizini var olan) yerlere yaz; hiçbiri yoksa standart yolu oluştur
+  const targets = all.filter((f) => fs.existsSync(path.dirname(f)));
+  for (const file of targets.length ? targets : [all[0]]) {
+    let cfg = {};
+    if (fs.existsSync(file)) {
+      const text = fs.readFileSync(file, 'utf8');
+      try { cfg = text.trim() ? JSON.parse(text) : {}; } catch { throw new Error(`${file} geçerli JSON değil; elle düzeltin`); }
+      fs.writeFileSync(`${file}.bak`, text);
+    }
+    cfg.mcpServers = { ...(cfg.mcpServers ?? {}), masvector: entry };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(cfg, null, 2));
+  }
+  return targets.length ? targets : [all[0]];
+}
+
+function claudeCli(args) {
+  return new Promise((resolve, reject) => {
+    // Windows'ta claude bir .cmd kabuk betiği olabilir → shell gerekir
+    // shell kipinde Node argümanları tırnaklamaz: boşluklu yollar (C:\Users\…\Programs\MasVector) elle tırnaklanır
+    const win32 = process.platform === 'win32';
+    execFile('claude', win32 ? args.map(quote) : args, { shell: win32, windowsHide: true, timeout: 30_000 }, (e, out, err) => {
+      if (!e) return resolve(String(out).trim());
+      const msg = `${err ?? ''}${out ?? ''}`;
+      if (e.code === 'ENOENT' || /not recognized|not found|bulunamad/i.test(msg)) reject(Object.assign(new Error("claude komutu bulunamadı (Claude Code kurulu değil ya da PATH'te değil). 'Ayarları kopyala' ile komutu alıp elle çalıştırabilirsiniz."), { code: 'ENOENT' }));
+      else reject(new Error(msg.trim() || e.message));
+    });
+  });
+}
+
+async function addToClaudeCode(stdio) {
+  const args = stdio
+    ? ['mcp', 'add', '--scope', 'user', 'masvector', '--env', 'ELECTRON_RUN_AS_NODE=1', '--', stdio.command, ...stdio.args] // --env çok değerli: adı yutmasın diye sonda
+    : ['mcp', 'add', '--scope', 'user', '--transport', 'http', 'masvector', `${SERVER}/mcp`];
+  try { return await claudeCli(args); }
+  catch (e) {
+    if (!/already exists/i.test(e.message)) throw e;
+    await claudeCli(['mcp', 'remove', '--scope', 'user', 'masvector']); // eski kaydı güncelle
+    return claudeCli(args);
+  }
+}
+
+async function connectClaude() {
+  const stdio = mcpStdio();
+  const desktopJson = JSON.stringify({ mcpServers: { masvector: stdio ?? { note: 'AppImage sürümünde HTTP bağlantısını kullanın' } } }, null, 2);
+  const codeCmd = stdio
+    ? `claude mcp add --scope user masvector --env ELECTRON_RUN_AS_NODE=1 -- ${[stdio.command, ...stdio.args].map(quote).join(' ')}`
+    : `claude mcp add --scope user --transport http masvector ${SERVER}/mcp`;
+  const httpCmd = `claude mcp add --scope user --transport http masvector ${SERVER}/mcp`;
+  const r = await dialog.showMessageBox(win, {
+    type: 'info', title: 'Claude\'a bağlan (MCP)', noLink: true, cancelId: 3, defaultId: 0,
+    buttons: ['Claude Desktop\'a ekle', 'Claude Code\'a ekle', 'Ayarları kopyala', 'Kapat'],
+    message: 'MasVector araçlarını Claude\'a MCP sunucusu olarak ekle',
+    detail: `Claude Desktop (claude_desktop_config.json):\n${desktopJson}\n\nClaude Code:\n${codeCmd}\n\nUygulama açıkken HTTP ile de bağlanılabilir:\n${httpCmd}\n\nEkledikten sonra Claude'u yeniden başlatın. Ajan çizdikçe bu pencerede canlı görürsünüz.`,
+  });
+  if (r.response === 0) {
+    if (!stdio) throw new Error('Bu kurulumda stdio bağlantısı yok; Claude Code HTTP komutunu kullanın');
+    const files = addToClaudeDesktop(stdio);
+    await dialog.showMessageBox(win, { type: 'info', title: 'Claude Desktop', message: 'MasVector eklendi. Claude Desktop\'u tamamen kapatıp yeniden açın.', detail: `Yazılan dosya(lar):\n${files.join('\n')}\n(Eski sürüm .bak olarak saklandı)` });
+  } else if (r.response === 1) {
+    const out = await addToClaudeCode(stdio);
+    await dialog.showMessageBox(win, { type: 'info', title: 'Claude Code', message: 'MasVector Claude Code\'a eklendi (kullanıcı kapsamı).', detail: `${out}\n\nYeni bir claude oturumunda /mcp ile doğrulayabilirsiniz.` });
+  } else if (r.response === 2) {
+    clipboard.writeText(`# Claude Desktop — claude_desktop_config.json\n${desktopJson}\n\n# Claude Code\n${codeCmd}\n\n# Uygulama açıkken HTTP\n${httpCmd}\n`);
+  }
 }
 
 function menu() {
@@ -90,6 +181,7 @@ function menu() {
         { role: 'quit', label: 'Çık' },
       ],
     },
+    { label: 'Ajanlar', submenu: [{ label: 'Claude\'a bağlan (MCP)…', click: guard(connectClaude) }, { label: 'MCP adresini kopyala', click: () => clipboard.writeText(`${SERVER}/mcp`) }] },
     { label: 'Görünüm', submenu: [{ role: 'reload', label: 'Yenile' }, { role: 'toggleDevTools', label: 'Geliştirici araçları' }, { type: 'separator' }, { role: 'togglefullscreen', label: 'Tam ekran' }] },
   ]);
 }
@@ -104,7 +196,29 @@ ipcMain.handle('save-export', async (_e, format, url) => {
 });
 ipcMain.handle('server-info', () => ({ server: SERVER, workspace: WORKSPACE, spawned: !!child }));
 
+// Pencere açmadan Claude'a kaydet: MasVector.exe --connect-claude=desktop|code|all
+async function connectClaudeCli(which) {
+  const stdio = mcpStdio();
+  const lines = [];
+  if (which === 'desktop' || which === 'all') {
+    if (!stdio) lines.push('Claude Desktop: bu kurulumda stdio yok (AppImage) — HTTP kullanın');
+    else lines.push(`Claude Desktop → ${addToClaudeDesktop(stdio).join(', ')}`);
+  }
+  if (which === 'code' || which === 'all') {
+    try { lines.push(`Claude Code → ${await addToClaudeCode(stdio)}`); }
+    catch (e) { lines.push(`Claude Code: ${e.message}`); if (which === 'code') process.exitCode = 1; }
+  }
+  return lines.join('\n');
+}
+
 app.whenReady().then(async () => {
+  const cc = argv.find((a) => a.startsWith('--connect-claude'));
+  if (cc) {
+    try { console.log(await connectClaudeCli(cc.split('=')[1] || 'all')); }
+    catch (e) { console.error(e.message); process.exitCode = 1; }
+    app.quit();
+    return;
+  }
   let how;
   try { how = await ensureServer(); }
   catch (e) { dialog.showErrorBox('MasVector', String(e.message)); app.quit(); return; }
@@ -127,4 +241,10 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => app.quit());
-app.on('quit', () => { if (child) child.kill('SIGTERM'); });
+// Windows'ta kill() sinyal göndermez, süreci doğrudan sonlandırır: önce son hali diske yazdır
+let quitting = false;
+app.on('before-quit', (e) => {
+  if (!child || quitting) return;
+  quitting = true; e.preventDefault();
+  rpc('doc_save', {}).catch(() => undefined).finally(() => { if (child) child.kill('SIGTERM'); app.quit(); });
+});

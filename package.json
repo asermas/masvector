@@ -14,7 +14,10 @@
     "mcp-http": "tsx src/bin/mcp-http.ts",
     "dev": "node scripts/build-ui.mjs && electron .",
     "demo": "tsx scripts/demo-agent.ts",
-    "vectorize": "tsx src/bin/vectorize.ts"
+    "vectorize": "tsx src/bin/vectorize.ts",
+    "icon": "node scripts/make-icon.mjs",
+    "dist:win": "npm run build && bash scripts/fetch-poppler-win.sh && node scripts/win-natives.mjs && node scripts/dist-win.cjs",
+    "dist:linux": "npm run build && LANG=C.UTF-8 electron-builder --linux --x64"
   },
   "license": "MIT",
   "dependencies": {
@@ -27,6 +30,7 @@
   "devDependencies": {
     "@types/node": "^26.6.2",
     "electron": "^41.7.1",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.28.2",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
@@ -40,5 +44,91 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "productName": "MasVector",
+  "author": "dumbuk <asermas1212@gmail.com>",
+  "build": {
+    "appId": "com.dumbuk.masvector",
+    "productName": "MasVector",
+    "copyright": "© 2026 dumbuk",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "asar": false,
+    "npmRebuild": false,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "extraResources": [
+        {
+          "from": "vendor/poppler-win",
+          "to": "poppler-win"
+        }
+      ],
+      "files": [
+        "dist/**/*",
+        "!dist/**/*.map",
+        "src/ui/electron/**/*",
+        "package.json",
+        "!node_modules/@napi-rs/canvas-linux*/**",
+        "!node_modules/@neplex/vectorizer-linux*/**",
+        "!node_modules/@napi-rs/canvas-darwin*/**",
+        "!node_modules/@neplex/vectorizer-darwin*/**"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "MasVector",
+      "artifactName": "MasVector-Kurulum-${version}.${ext}",
+      "installerLanguages": [
+        "tr_TR"
+      ],
+      "language": "1055"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Graphics",
+      "icon": "build/icon.png",
+      "maintainer": "dumbuk <asermas1212@gmail.com>",
+      "synopsis": "Ajanların MCP ile çizdiği vektör editörü",
+      "files": [
+        "dist/**/*",
+        "!dist/**/*.map",
+        "src/ui/electron/**/*",
+        "package.json",
+        "!node_modules/@napi-rs/canvas-win32*/**",
+        "!node_modules/@neplex/vectorizer-win32*/**",
+        "!node_modules/@napi-rs/canvas-darwin*/**",
+        "!node_modules/@neplex/vectorizer-darwin*/**",
+        "!node_modules/@napi-rs/canvas-linux-x64-musl/**",
+        "!node_modules/@neplex/vectorizer-linux-x64-musl/**"
+      ]
+    },
+    "deb": {
+      "depends": [
+        "poppler-utils"
+      ]
+    }
   }
 }

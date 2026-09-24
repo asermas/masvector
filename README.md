@@ -52,6 +52,39 @@ claude mcp add masvector -- node /home/anilmas/masvector-claude/dist/bin/mcp-std
 node dist/bin/mcp-stdio.js --workspace ./cizim --serve-ui 7880   # tarayıcıda http://127.0.0.1:7880
 ```
 
+## Windows (.exe) ve paketleme
+
+```bash
+npm run dist:win     # → release/MasVector-Kurulum-1.0.0.exe (NSIS kurulum) + MasVector-1.0.0-win.zip (taşınabilir)
+npm run dist:linux   # → AppImage + .deb
+```
+
+Windows paketi Linux'ta **wine gerektirmeden** üretilir:
+- `scripts/win-natives.mjs` — `@napi-rs/canvas` ve `@neplex/vectorizer`'ın win32-x64 derlemelerini `node_modules`'e koyar (yalnız sistem DLL'lerine bağlılar).
+- `scripts/fetch-poppler-win.sh` — PDF için poppler'ı (pdftocairo/pdftoppm/pdfinfo) indirir, yalnız içe aktarılan DLL'leri tutar → `resources/poppler-win`. Kullanıcının ayrıca bir şey kurması gerekmez.
+- `scripts/dist-win.cjs` — electron-builder'ın kaldırıcıyı wine ile çıkarma adımı yerine saf JS okuyucusunu kullanır.
+- Tuzak: makensis Türkçe yerel ayarda (`i`→`İ`) yönergeleri tanımıyor; betik `LANG=C.UTF-8` ayarlar.
+
+Kurulum kullanıcı başınadır (`%LOCALAPPDATA%\Programs\MasVector`, yönetici izni gerekmez), masaüstü ve Başlat menüsü kısayolu oluşturur. İmzasız olduğu için ilk açılışta SmartScreen "Yine de çalıştır" isteyebilir.
+
+### Claude'a bağlama (Windows / paketli sürüm)
+
+Uygulamada **Ajanlar → Claude'a bağlan (MCP)…**:
+- **Claude Desktop'a ekle** → `%APPDATA%\Claude\claude_desktop_config.json` (Microsoft Store sürümünün sanal yolu da) içine `masvector` sunucusunu yazar, eskisini `.bak` olarak saklar. Claude Desktop yeniden başlatılır.
+- **Claude Code'a ekle** → `claude mcp add --scope user …` çalıştırır.
+
+Pencere açmadan: `MasVector.exe --connect-claude=desktop|code|all`.
+
+Kaydedilen komut uygulamanın kendi exe'sidir; ayrı Node kurulumu gerekmez:
+```json
+{ "mcpServers": { "masvector": {
+  "command": "C:\\Users\\<ad>\\AppData\\Local\\Programs\\MasVector\\MasVector.exe",
+  "args": ["C:\\Users\\<ad>\\AppData\\Local\\Programs\\MasVector\\resources\\app\\dist\\bin\\mcp-stdio.js",
+           "--server", "http://127.0.0.1:7878", "--ensure-server"],
+  "env": { "ELECTRON_RUN_AS_NODE": "1" } } } }
+```
+`ELECTRON_RUN_AS_NODE=1` exe'yi düz Node olarak çalıştırır; `--ensure-server` masaüstü uygulaması kapalıysa belge sunucusunu arka planda başlatır (çalışma dizini `~/MasVector`). Uygulama açıksa ajan çizdikçe pencerede canlı görünür. Uygulama açıkken HTTP de kullanılabilir: `claude mcp add --transport http masvector http://127.0.0.1:7878/mcp`.
+
 ## PDF / görsel → vektör
 
 Uygulama kendi başına (komut satırı), arayüzden ("Vektörleştir…" düğmesi, Electron'da *Dosya → PDF / görsel vektörleştir…*) veya bir ajan üzerinden (MCP: `pdf_import`, `vectorize_image`, `compare_reference`) çalışır. Her dönüşüm kaynağa karşı **piksel piksel doğrulanır** ve raporlanır.
