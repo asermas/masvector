@@ -135,7 +135,9 @@ export function createMcpServer(backend: Backend, opts: McpOptions): McpServer {
     return { content: [text(r)] };
   });
   reg('pdf_import', 'PDF\'i vektör olarak içe aktar. Vektör sayfalar kayıpsız gelir (yollar, gradyanlar, kırpmalar, gömülü görseller; metin = glif eğrileri) ve yapı sadeleştirilir (glifler satır başına tek path, gereksiz kırpmalar temizlenir). Taranmış (yalnız görsel içeren) sayfalar otomatik tespit edilip 300 dpi üzerinden izlenir. Her sayfa ayrı frame; her biri poppler render\'ıyla doğrulanır (fidelity). mode=replace yeni belge, append mevcut belgeye frame ekler.', {
-    path: z.string(),
+    path: z.string().optional().describe('PDF dosyası (sunucu çalışma dizinine göreli)'),
+    data: z.string().optional().describe('veya PDF içeriği base64'),
+    name: z.string().optional().describe('Belge adı'),
     pages: z.array(z.number().int().positive()).optional().describe('Sayfa numaraları (1\'den); yoksa tümü'),
     mode: z.enum(['replace', 'append']).optional(),
     verify: z.boolean().optional().describe('Poppler render\'ıyla piksel doğrulaması (varsayılan true)'),

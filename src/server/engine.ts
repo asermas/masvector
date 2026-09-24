@@ -1,5 +1,6 @@
 import { promises as fs, readFileSync } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import type { VDocument, VNode } from '../common/types.js';
 import { VectorError, invalid } from '../common/errors.js';
 import { DOC_FILENAME, newId } from '../common/ids.js';
@@ -364,8 +365,7 @@ export class DocumentEngine {
     this.assertCanWrite(ctx, p.expectedVersion);
     const { buf, name, file } = await this.readInput(p);
     if (isPdf(file ?? '', buf)) {
-      if (!file) throw invalid('PDF için path verin');
-      return this.importPdf(ctx, { path: p.path!, mode: p.mode === 'merge' ? 'append' : 'replace' });
+      return this.importPdf(ctx, file ? { path: p.path!, mode: p.mode === 'merge' ? 'append' : 'replace' } : { data: buf.toString('base64'), mode: p.mode === 'merge' ? 'append' : 'replace' });
     }
     if (p.mode === 'merge') {
       const { group, report } = await vectorizeImageAsGroup(buf, { ...p, name: p.name ?? `${name} (vektör)` });
@@ -384,11 +384,21 @@ export class DocumentEngine {
   }
 
   /** PDF içe aktar (vektör sayfalar birebir; taranmış sayfalar izlenir). replace: yeni belge; append: frame olarak ekle. */
-  async importPdf(ctx: CallContext, p: { path: string; pages?: number[]; mode?: 'replace' | 'append'; verify?: boolean; traceScanned?: boolean; password?: string; trace?: VectorizeImageOptions; expectedVersion?: number }) {
+  async importPdf(ctx: CallContext, p: { path?: string; data?: string; name?: string; pages?: number[]; mode?: 'replace' | 'append'; verify?: boolean; traceScanned?: boolean; password?: string; trace?: VectorizeImageOptions; expectedVersion?: number }) {
     this.assertCanWrite(ctx, p.expectedVersion);
-    if (!p.path) throw invalid('pdf_import: path gerekli');
-    const abs = this.resolvePath(p.path);
-    const { doc, info, reports } = await pdfToDoc(abs, { pages: p.pages, verifyDpi: p.verify === false ? 0 : 144, password: p.password, traceScanned: p.traceScanned, trace: p.trace });
+    let abs: string;
+    let tmpFile: string | null = null;
+    if (p.data) {
+      // Yüklenen PDF (UI / uzak ajant): geçici dosyaya yaz
+      tmpFile = path.join(os.tmpdir(), `masvector-upload-${process.pid}-${Date.now()}.pdf`);
+      await fs.writeFile(tmpFile, Buffer.from(p.data.replace(/^data:[^;,]+;base64,/, ''), 'base64'));
+      abs = tmpFile;
+    } else if (p.path) abs = this.resolvePath(p.path);
+    else throw invalid('pdf_import: path veya data (base64) gerekli');
+    const { doc, info, reports } = await pdfToDoc(abs, { pages: p.pages, verifyDpi: p.verify === false ? 0 : 144, password: p.password, traceScanned: p.traceScanned, trace: p.trace })
+      .finally(() => { if (tmpFile) void fs.rm(tmpFile, { force: true }); });
+    if (p.name) doc.title = p.name;
+    else if (tmpFile) doc.title = info.title ?? 'Yüklenen PDF';
     return this.mutate(ctx, 'pdf_import', (d) => {
       if (p.mode === 'append') {
         const page = findPage(d);

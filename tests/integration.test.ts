@@ -259,3 +259,32 @@ describe('MCP stdio', () => {
     await client.close();
   }, 20_000);
 });
+
+describe('MCP: PDF / görsel → vektör', () => {
+  it('ajant PDF\'i ve görseli MCP üzerinden vektöre çevirir, fark haritasını görsel olarak alır', async () => {
+    const { copyFileSync } = await import('node:fs');
+    copyFileSync(path.resolve('tests/fixtures/vector.pdf'), path.join(workspace, 'girdi.pdf'));
+    copyFileSync(path.resolve('tests/fixtures/logo.png'), path.join(workspace, 'logo.png'));
+    const a = await agent('vektorcu');
+    const pdf = await a.call('pdf_import', { path: 'girdi.pdf' });
+    expect(pdf.isError).toBe(false);
+    expect(pdf.json.result.imported[0].kind).toBe('pdf-vector');
+    expect(pdf.json.result.imported[0].fidelity.pctOff).toBeLessThan(0.25);
+    const img = await a.call('vectorize_image', { path: 'logo.png' });
+    expect(img.isError).toBe(false);
+    expect(img.json.result.report.fidelity.pctOff).toBeLessThan(0.25);
+    const cmp = await a.call('compare_reference', {});
+    expect(cmp.isError).toBe(false);
+    expect(cmp.raw.content.some((c: any) => c.type === 'image' && c.mimeType === 'image/png')).toBe(true);
+    // Birleştirme kipi: mevcut belgeye yerleştir
+    const merged = await a.call('vectorize_image', { path: 'logo.png', mode: 'merge', placement: { x: 10, y: 10, width: 300 } });
+    // Zemin eklenmez (logo saydam yerleşir): içerik genişliği yerleşim genişliğini aşmaz
+    expect(merged.json.result.bbox.width).toBeLessThanOrEqual(300.5);
+    expect(merged.json.result.bbox.width).toBeGreaterThan(200);
+    // doc_open da PDF'i tanır
+    const opened = await a.call('doc_open', { path: 'girdi.pdf' });
+    expect(opened.isError).toBe(false);
+    await a.client.close();
+  }, 180_000);
+});
+

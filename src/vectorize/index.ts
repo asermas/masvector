@@ -128,7 +128,8 @@ export async function vectorizeImageAsGroup(buf: Buffer, o: VectorizeImageOption
     type: 'group', id: newId('group'), name: o.name ?? r.group.name, transform: { a: sx, b: 0, c: 0, d: sy, e: p.x, f: p.y },
     style: defaultStyle({ fill: 'none' }), visible: true, locked: false, children: [],
   };
-  if (r.background && o.background !== 'remove') {
+  // Mevcut tasarıma yerleştirirken zemin istenmez (logo saydam gelmeli); yalnız açıkça 'keep' denirse eklenir
+  if (r.background && o.background === 'keep') {
     g.children.push({ type: 'rect', id: newId('rect'), name: 'Arka plan', transform: { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 }, style: defaultStyle({ fill: r.background }), visible: true, locked: false, x: 0, y: 0, width: r.width, height: r.height });
   }
   g.children.push(r.group);

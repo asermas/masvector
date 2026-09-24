@@ -60,6 +60,17 @@ function menu() {
           }),
         },
         {
+          label: 'PDF / görsel vektörleştir…', accelerator: 'CmdOrCtrl+Shift+V', click: guard(async () => {
+            const r = await dialog.showOpenDialog(win, { filters: [{ name: 'PDF / Görsel', extensions: ['pdf', 'png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tif', 'tiff'] }], properties: ['openFile'] });
+            if (r.canceled || !r.filePaths[0]) return;
+            const file = r.filePaths[0];
+            const res = /\.pdf$/i.test(file) ? await rpc('pdf_import', { path: file, mode: 'replace' }) : await rpc('vectorize_image', { path: file, mode: 'replace' });
+            const reps = res.result?.imported ?? [res.result?.report];
+            const f = reps?.[0]?.fidelity;
+            dialog.showMessageBox(win, { type: 'info', title: 'Vektörleştirme', message: `${path.basename(file)} vektöre çevrildi`, detail: f ? `Sadakat: ${f.verdict} (%${f.pctOff} hatalı piksel, PSNR ${f.psnr} dB)` : 'Tamamlandı' });
+          }),
+        },
+        {
           label: 'SVG içe aktar (birleştir)…', click: guard(async () => {
             const r = await dialog.showOpenDialog(win, { filters: [{ name: 'SVG', extensions: ['svg'] }], properties: ['openFile'] });
             if (!r.canceled && r.filePaths[0]) await rpc('doc_import', { path: r.filePaths[0], format: 'svg', mode: 'merge', name: path.basename(r.filePaths[0]) });

@@ -98,6 +98,20 @@ async function run<T>(p: Promise<T>): Promise<T | undefined> {
 let dirty = true;
 const invalidate = () => { dirty = true; };
 
+/** data URI → HTMLImageElement (yüklenince yeniden çiz). */
+const imageCache = new Map<string, HTMLImageElement>();
+function getImage(href: string): CanvasImageSource | null {
+  let img = imageCache.get(href);
+  if (!img) {
+    img = new Image();
+    img.onload = invalidate;
+    img.src = href;
+    imageCache.set(href, img);
+    if (imageCache.size > 64) imageCache.delete(imageCache.keys().next().value!);
+  }
+  return img.complete && img.naturalWidth ? img : null;
+}
+
 function resize() {
   const r = canvas.getBoundingClientRect();
   state.dpr = window.devicePixelRatio || 1;
@@ -169,6 +183,7 @@ function draw() {
   drawFrame(ctx, renderedFrame(f), screen, {
     width: canvas.width, height: canvas.height, background: false,
     createLayer: (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return { canvas: c, ctx: c.getContext('2d')! }; },
+    getImage,
   });
   ctx.restore();
 
@@ -285,6 +300,7 @@ function traceNode(n: VNode) {
   if (n.type === 'ellipse') { ctx.ellipse(n.x + n.width / 2, n.y + n.height / 2, Math.abs(n.width / 2), Math.abs(n.height / 2), 0, 0, Math.PI * 2); return; }
   if (n.type === 'line') { ctx.moveTo(n.x1, n.y1); ctx.lineTo(n.x2, n.y2); return; }
   if (n.type === 'text') { const b = textBox(n); ctx.rect(b.x, b.y, b.w, b.h); return; }
+  if (n.type === 'image') { ctx.rect(n.x, n.y, n.width, n.height); return; }
   tracePathLocal(n.subpaths);
 }
 
@@ -775,6 +791,7 @@ async function cmd(c: string) {
     case 'zoom-in': zoomAt(canvas.clientWidth / 2, canvas.clientHeight / 2, 1.25); break;
     case 'zoom-out': zoomAt(canvas.clientWidth / 2, canvas.clientHeight / 2, 0.8); break;
     case 'save': { const r = await run(api.rpc('doc_save', {})); if (r) toast(`Kaydedildi: ${r.path}`, 'info'); break; }
+    case 'vectorize': $<HTMLInputElement>('vec-file').click(); break;
     case 'export-svg': case 'export-png': case 'export-pdf': {
       const fmt = c.slice(7) as 'svg' | 'png' | 'pdf';
       const bridge = (window as any).masvector;
@@ -785,6 +802,31 @@ async function cmd(c: string) {
   }
 }
 document.querySelectorAll<HTMLButtonElement>('[data-cmd]').forEach((b) => b.addEventListener('click', () => void cmd(b.dataset.cmd!)));
+
+// PDF / görsel → vektör: dosyayı base64 olarak Document Server'a gönder (belge sunucuda oluşur, SSE ile gelir)
+$<HTMLInputElement>('vec-file').addEventListener('change', async (e) => {
+  const input = e.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = '';
+  if (!file) return;
+  if (file.size > 60 * 1024 * 1024) { toast('Dosya çok büyük (en çok 60 MB)'); return; }
+  const data = await new Promise<string>((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result)); r.onerror = () => rej(r.error); r.readAsDataURL(file); });
+  const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+  toast(`${file.name} vektörleştiriliyor…`, 'info');
+  const btn = document.querySelector<HTMLButtonElement>('[data-cmd="vectorize"]')!;
+  btn.disabled = true;
+  try {
+    const r: any = await run(isPdf ? api.rpc('pdf_import', { data, mode: 'replace', name: file.name.replace(/\.[^.]+$/, '') }) : api.rpc('vectorize_image', { data, mode: 'replace', name: file.name.replace(/\.[^.]+$/, '') }));
+    if (!r) return;
+    const reps = isPdf ? r.result.imported : [{ ...r.result.report, page: 1 }];
+    const worst = reps.reduce((m: any, x: any) => (!m || (x.fidelity?.pctOff ?? 0) > (m.fidelity?.pctOff ?? 0) ? x : m), null);
+    const f = worst?.fidelity;
+    toast(`Tamam: ${reps.length} sayfa · sadakat ${f ? `${f.verdict} (%${f.pctOff} fark)` : '—'} · "Referans" katmanını açıp karşılaştırabilirsiniz`, 'info');
+    state.fitted = false;
+    state.selection = [];
+    fit();
+  } finally { btn.disabled = false; }
+});
 
 async function action(a: string, extra: Record<string, unknown> = {}) {
   const ids = state.selection;
@@ -814,7 +856,7 @@ function refreshPanels() {
   invalidate();
 }
 
-const TYPE_ICON: Record<string, string> = { path: '✎', rect: '▭', ellipse: '◯', line: '╱', text: 'T', group: '▣' };
+const TYPE_ICON: Record<string, string> = { path: '✎', rect: '▭', ellipse: '◯', line: '╱', text: 'T', group: '▣', image: '▦' };
 
 function renderLayers() {
   const el = $('layers');

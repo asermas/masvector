@@ -20,7 +20,7 @@ Ajantların (LLM'lerin) MCP üzerinden bağlanıp profesyonel vektör çizim yap
 ```bash
 npm install
 npm run build        # tsc + renderer tip kontrolü + UI paketi (dist/)
-npm test             # 44 test: birim + gerçek MCP istemcili entegrasyon
+npm test             # 56 test: birim + vektörleştirme kalitesi + gerçek MCP istemcili entegrasyon
 ```
 
 ```bash
@@ -52,6 +52,62 @@ claude mcp add masvector -- node /home/anilmas/masvector-claude/dist/bin/mcp-std
 node dist/bin/mcp-stdio.js --workspace ./cizim --serve-ui 7880   # tarayıcıda http://127.0.0.1:7880
 ```
 
+## PDF / görsel → vektör
+
+Uygulama kendi başına (komut satırı), arayüzden ("Vektörleştir…" düğmesi, Electron'da *Dosya → PDF / görsel vektörleştir…*) veya bir ajan üzerinden (MCP: `pdf_import`, `vectorize_image`, `compare_reference`) çalışır. Her dönüşüm kaynağa karşı **piksel piksel doğrulanır** ve raporlanır.
+
+```bash
+npm run vectorize -- logo.jpg --out cikti/logo --formats svg,pdf,png --diff
+npm run vectorize -- katalog.pdf --pages 1,3 --out cikti/katalog
+npm run vectorize -- kurumsal.png --palette "#d91933,#193373,#f3a619"
+```
+
+**PDF:**
+- Vektör sayfalar poppler (`pdftocairo`) ile kayıpsız okunur: yollar, gradyanlar, kırpma maskeleri, alfalı görseller; metin glif eğrisi olarak gelir.
+- Ardından yapı, görüntü değişmeden sadeleştirilir:
+  - glifler satır başına tek path'e birleştirilir,
+  - gereksiz kırpmalar atılır,
+  - "gradyan dikdörtgen + yuvarlak kırpma" gibi kalıplar tek şekle indirilir,
+  - sayfa zemini frame arka planı olur.
+- Test sayfasında 171 node 8'e indi ve doğrulama `pdftoppm` render'ına karşı %0,04 fark verdi.
+- Taranmış (yalnız görsel içeren) sayfalar otomatik tespit edilip 300 dpi'den izlenir.
+
+**Görsel (PNG/JPEG/WebP/GIF/BMP/TIFF):** iki kip yarışır, ölçüte göre iyi olan (eşitse daha sade olan) seçilir.
+- **Palet kipi (logo/düz renk):**
+  1. OKLab'de k-means; palet yalnız düz bölgelerden öğrenilir. Böylece kenar yumuşatma karışımları sahte renk üretmez.
+  2. Kenar pikselleri yalnız komşu düz bölgelerin renklerinden birine atanır.
+  3. Çoğunluk filtresi ve leke temizliği uygulanır.
+  4. Her renk kendi bağımsız şekli olarak izlenir (vtracer) ve yalnız üstündeki komşu renklerin altına ~1 px taşar: ne boşluk kalır ne gizli geometri.
+  5. Son olarak: gürültü uyarlamalı maske yumuşatma, Schneider eğri uydurma (pencereli köşe algılama), eşdoğrusal kübikleri doğruya indirme ve sivri köşe onarımı.
+- **Gradyan kipi (illüstrasyon/ikon/foto):**
+  1. Görsel keskin kenarlardan bölgelere ayrılır.
+  2. Her bölgeye sabit, doğrusal ya da radyal gradyan uydurulur (duraklar ve opaklık dahil).
+  3. Modelin açıklayamadığı piksel kümeleri ayrı bölge olur (gradyan zemin üstündeki düşük kontrastlı şekiller).
+  4. Saydam zemine sönen yumuşak gölge ve parıltılar halka halka değil, **bulanıklık filtreli tek şekil** olarak çıkar.
+
+**Doğrulama ölçütü:**
+- Algısal renk farkı (OKLab ΔE > 0,04) üzerinden hesaplanır.
+- 1 px konum ve kenar yumuşatma karışımı toleranslıdır.
+- JPEG gibi kayıplı kaynaklarda gürültüsü giderilmiş kaynağa karşı ölçülür.
+- Karar: < %0,25 **mükemmel**, < %1 **çok iyi**.
+
+Ölçülmüş sonuçlar (Ubuntu sistem görselleri + test fikstürleri):
+
+| Girdi | Tür | Fark | Sonuç | Katman / çapa |
+|---|---|---|---|---|
+| Logo PNG | düz 3 renk | %0,08 | mükemmel | 3 / 112 |
+| Aynı logo, JPEG %55 | gürültülü | %0,24 | mükemmel | 3 / 235 |
+| Aynı logo, 360 px JPEG | küçük | %0,74 | çok iyi | 3 / 103 |
+| Gradyanlı illüstrasyon | gradyan + gölge | %0,12 | mükemmel | 113 / 3305 |
+| Firefox ikonu 256 px | karmaşık gradyan | %0,24 | mükemmel | 95 / 1043 |
+| Ubuntu ikonu 256 px | gradyan + yumuşak gölge | %0,15 | mükemmel | 58 / 510 |
+| Ubuntu metin logosu | saydam zemin | %0,14 | mükemmel | 3 / 137 |
+| Düşük poligon rakun 4K | düşük kontrast | %0,03 | mükemmel | 6 / 279 |
+| Uçan kutular 4K | dalga + gölge | %0,08 | mükemmel | 35 / 16 k |
+| Fotoğraf (Red Acer 4K) | foto | %0,44 | çok iyi | 844 / 71 k (2,5 MB) |
+| Taranmış PDF | raster sayfa | %0,10 | mükemmel | 3 |
+| Vektör PDF | yol + metin + görsel | %0,04 | mükemmel | 8 |
+
 ## MCP yüzeyi
 
 | Grup | Tool'lar |
@@ -62,6 +118,7 @@ node dist/bin/mcp-stdio.js --workspace ./cizim --serve-ui 7880   # tarayıcıda 
 | Operasyon | `boolean_union` `boolean_subtract` `boolean_intersect` `boolean_exclude` `path_offset` `path_outline_stroke` `group` `ungroup` `duplicate` `batch` |
 | Katman / frame | `layer_create` `layer_move_node` `layer_toggle` `layer_lock` `frame_create` `frame_update` |
 | Hassasiyet | `snap_to_grid` `add_guide` `remove_guide` `align_to` `distribute` |
+| Vektörleştirme | `pdf_import` (vektör birebir, taranmış → izleme) `vectorize_image` (replace/merge) `compare_reference` (metrik + fark haritası görseli) |
 | Görüntü / sorgu | `render_preview` (görsel döner; `grid`, `region`) `query_bbox` `query_intersect` `query_hit` |
 | Geçmiş / kilit | `undo` `redo` `lock_acquire` `lock_release` `lock_status` |
 | Resource | `masvector://document.json` `masvector://design.svg` `masvector://preview.png` `masvector://guide` |
@@ -86,6 +143,11 @@ node dist/bin/mcp-stdio.js --workspace ./cizim --serve-ui 7880   # tarayıcıda 
 - **PDF** harici bağımlılık olmadan yazılır ve tamamen vektördür: Bézier'ler `c` operatörüyle, gradyanlar gerçek PDF shading ile, opaklık ve karışım modları ExtGState ile.
 
 ## Bilinen sınırlar
+
+- Fotoğraflar vektörleştirilebilir ama sonuç ağırdır (binlerce şekil) ve fotoğrafik ayrıntı basitleşir; vektör, logo/illüstrasyon/çizim için doğru araçtır.
+- SVG yalnız doğrusal/radyal gradyanı destekler: karmaşık 2B renk geçişleri birkaç gradyan bölgesine bölünür (yakından bakınca hafif dikiş görülebilir).
+- PDF içe aktarma poppler-utils gerektirir (`sudo apt install poppler-utils`). PDF metinleri glif eğrisi olarak gelir (görünüm birebir, düzenlenebilir metin değil).
+- Karmaşık yumuşak maskeler (görsel olmayan `mask` içerikleri) maskesiz aktarılır ve uyarı verilir.
 
 - SVG import: `clipPath`/`mask`/`pattern`/`marker` desteklenmez (uyarı döner). `<tspan>` konumlandırması tek satıra indirgenir.
 - Sunucuda font ölçümü yoktur; metin bbox'ı karakter genişliği tahminidir. Metin boolean işlemlerine giremez.
