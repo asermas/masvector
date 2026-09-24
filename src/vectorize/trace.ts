@@ -1,13 +1,14 @@
 import { vectorizeRaw, ColorMode, Hierarchical, PathSimplifyMode } from '@neplex/vectorizer';
 import { createCanvas } from '@napi-rs/canvas';
-import type { GroupNode, PathNode, SubPath, VNode } from '../common/types.js';
+import type { GroupNode, Paint, PathNode, SubPath, VNode } from '../common/types.js';
+import { detectSoftGroups, evalPaint, segmentRegions, type Region, type SoftGroup } from './regions.js';
 import { defaultStyle, newId } from '../common/ids.js';
 import { VectorError } from '../common/errors.js';
 import { parsePathData } from '../serialization/path-data.js';
 import { transformSubPath, flattenSubPaths, segments, subpathsBBox } from '../math/bezier.js';
 import { fitClosedPolygon } from '../math/fit.js';
 import { decodeImageBuffer, type DecodedImage } from '../render/png.js';
-import { extractPalette, labelize, modeFilter, removeSpeckles, type Palette, type Raster } from './quantize.js';
+import { extractPalette, labelize, modeFilter, removeSpeckles, rgbToOklab, type Palette, type Raster } from './quantize.js';
 
 // Raster → vektör izleme hattı:
 //  1) çöz + gerekirse büyüt (küçük görsellerde pürüzsüz kenar için)
@@ -37,13 +38,15 @@ export interface TraceOptions {
    * abutting: şekiller birebir bitişik, üst üste binme yok (kıl payı boşluk riski).
    */
   method?: 'overlap' | 'stacked' | 'abutting';
+  /** Yumuşak geçişleri gerçek doğrusal/radyal gradyan olarak geri kazan (varsayılan: illustration/photo'da açık). */
+  gradients?: boolean;
 }
 
 export interface TraceResult {
   width: number; height: number;
   group: GroupNode;
   background: string | null;
-  palette: { color: string; coverage: number; paths: number; anchors: number }[];
+  palette: { color: string; coverage: number; paths: number; anchors: number; gradient?: 'linear' | 'radial' }[];
   preset: TracePreset;
   scale: number;
   stats: { anchors: number; subpaths: number; speckles: number; noise: number; blur: number; ms: number };
@@ -76,7 +79,8 @@ function classify(img: Raster): TracePreset {
   for (let p = 0; p < n; p += step) {
     if (img.rgba[p * 4 + 3] < 128) continue;
     const r = img.rgba[p * 4], g = img.rgba[p * 4 + 1], b = img.rgba[p * 4 + 2];
-    buckets.set(((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4), (buckets.get(((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4)) ?? 0) + 1);
+    const key = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3); // 5 bit/kanal: düşük kontrastlı düz renkler ayrışsın
+    buckets.set(key, (buckets.get(key) ?? 0) + 1);
     if (Math.max(r, g, b) - Math.min(r, g, b) < 24) gray++;
     total++;
   }
@@ -181,16 +185,23 @@ export function sharpenCorners(sp: SubPath, shortLen: number, minAngleDeg = 20):
   return { closed: true, points: pts };
 }
 
-async function traceMask(mask: Uint8Array, w: number, h: number, cfg: { speckle: number; corner: number; length: number; splice: number }): Promise<SubPath[]> {
+async function traceMask(mask: Uint8Array, W: number, H: number, cfg: { speckle: number; corner: number; length: number; splice: number }): Promise<SubPath[]> {
+  // Maskenin sınır kutusuna kırp (küçük bölgelerde büyük hız kazancı)
+  let x0 = W, y0 = H, x1 = -1, y1 = -1;
+  for (let y = 0; y < H; y++) { const row = y * W; for (let x = 0; x < W; x++) if (mask[row + x]) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; } }
+  if (x1 < 0) return [];
+  const pad = 4;
+  x0 = Math.max(0, x0 - pad); y0 = Math.max(0, y0 - pad); x1 = Math.min(W - 1, x1 + pad); y1 = Math.min(H - 1, y1 + pad);
+  const w = x1 - x0 + 1, h = y1 - y0 + 1;
   const px = Buffer.alloc(w * h * 4, 255);
-  for (let p = 0; p < w * h; p++) if (mask[p]) { px[p * 4] = 0; px[p * 4 + 1] = 0; px[p * 4 + 2] = 0; }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (mask[(y + y0) * W + x + x0]) { const p = (y * w + x) * 4; px[p] = 0; px[p + 1] = 0; px[p + 2] = 0; }
   const svg = await vectorizeRaw(px, { width: w, height: h }, {
     colorMode: ColorMode.Binary, hierarchical: Hierarchical.Cutout, filterSpeckle: cfg.speckle, colorPrecision: 8, layerDifference: 1,
     mode: PathSimplifyMode.Spline, cornerThreshold: cfg.corner, lengthThreshold: cfg.length, maxIterations: 10, spliceThreshold: cfg.splice, pathPrecision: 3,
   });
   const out: SubPath[] = [];
   for (const m of svg.matchAll(/<path d="([^"]+)"[^>]*?(?:transform="translate\(([-\d.e]+),([-\d.e]+)\)")?\s*\/>/g)) {
-    const tx = Number(m[2] ?? 0), ty = Number(m[3] ?? 0);
+    const tx = Number(m[2] ?? 0) + x0, ty = Number(m[3] ?? 0) + y0;
     for (const sp of parsePathData(m[1])) out.push(transformSubPath(sp, { a: 1, b: 0, c: 0, d: 1, e: tx, f: ty }));
   }
   return out;
@@ -217,25 +228,177 @@ export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions =
   const w = Math.max(1, Math.round(W * k)), h = Math.max(1, Math.round(H * k));
   const img = resize(src, w, h);
 
-  // Palet
-  let pal: Palette;
-  if (o.palette?.length) pal = extractPalette(img, { fixed: o.palette.map(parseHex) });
-  else if (preset === 'lineart') pal = extractPalette(img, { k: o.colors ?? 2 });
-  else pal = extractPalette(img, { k: o.colors, maxK: o.maxColors ?? (preset === 'logo' ? 16 : preset === 'illustration' ? 32 : 48), targetError: preset === 'photo' ? 0.03 : 0.016 });
-  if (preset === 'photo') warnings.push('Fotoğraf benzeri görsel: vektör sonucu posterize görünür ve çok sayıda şekil içerir. En iyi sonuç logo/illüstrasyon/çizimlerde alınır.');
-
-  // Etiketler + temizlik
-  let lab = labelize(img, pal);
-  lab = modeFilter(lab, w, h, detail > 0.8 ? 0 : 1);
-  // Leke eşiği ORİJİNAL piksel cinsinden (küçük görsellerde noktalar/i-noktaları korunmalı)
-  const speckleArea = Math.max(1, Math.round(((1 - detail) * 12 + 1) * k * k));
-  const speckles = removeSpeckles(lab, w, h, speckleArea);
+  // Etiket haritası + etiket başına boya (düz renk veya gradyan, ORİJİNAL piksel koordinatında)
+  const useGradients = o.gradients ?? (!o.palette?.length && (preset === 'illustration' || preset === 'photo'));
+  let lab: Int16Array;
+  let fills: Paint[];
+  let models: ('solid' | 'linear' | 'radial')[];
+  const softByLabel = new Map<number, { g: SoftGroup; s: number; segW: number; segH: number; labels: Int32Array; rgba: Uint8ClampedArray }>();
+  const speckleArea = Math.max(1, Math.round(((1 - detail) * 12 + 1) * k * k)); // ORİJİNAL piksel cinsinden eşik × k²
+  let speckles = 0;
+  if (useGradients) {
+    if (k >= 2.5) {
+      // KÜÇÜK görsel, yoğun büyütme: segmentasyon büyütülmüş görüntüde + yumuşatma şeritleri eritilir (hale kalmaz)
+      // Segmentasyon doğrudan çalışma çözünürlüğünde (pürüzsüz büyütülmüş görüntü): etiket büyütme merdiveni oluşmaz
+      const s = k;
+      const sw = w, sh = h;
+      const segImg = img;
+      const nz = estimateNoise(probe);
+      const seg = segmentRegions(segImg, {
+        minArea: Math.max(6, Math.round(((1 - detail) * 30 + 6) * k * k)),
+        // Büyütmede kenarlar ~k piksele yayılır: piksel başı kenar eşiği k ile ölçeklenir
+        edge: Math.min(0.05, (0.018 + nz * 0.006) / Math.max(1, k * 0.6)),
+        maxRms: Math.min(9, Math.max(3, 2.5 + nz * 1.5)),
+        outlier: Math.min(14, 5 + nz * 3),
+        // Yumuşatma karışımı şeritlerini (büyütmede ~k px) kalın komşulara erit: vektörde hale kalmasın
+        mergeThin: true,
+        thinRatio: 0.8 * Math.max(1, k),
+      });
+      // Aynı düz rengi paylaşan bölgeleri tek etikette topla (tek path, daha az node)
+      // Algısal olarak ayırt edilemeyen düz renkleri (ΔE_ok < 0.025) alanı en büyük temsilcide birleştir
+      const reps: { lab: [number, number, number]; hex: string }[] = [];
+      const snap = new Map<string, string>();
+      for (const r of [...seg.regions].sort((a, b) => b.area - a.area)) {
+        if (typeof r.paint !== 'string' || snap.has(r.paint)) continue;
+        const [R, G, B] = parseHex(r.paint.slice(0, 7));
+        if (r.paint.length > 7) { snap.set(r.paint, r.paint); continue; } // yarı saydamlar birleştirilmez
+        const c = rgbToOklab(R, G, B);
+        const hit = reps.find((q) => (q.lab[0] - c[0]) ** 2 + (q.lab[1] - c[1]) ** 2 + (q.lab[2] - c[2]) ** 2 < 0.025 ** 2);
+        if (hit) snap.set(r.paint, hit.hex); else { reps.push({ lab: c, hex: r.paint }); snap.set(r.paint, r.paint); }
+      }
+      for (const r of seg.regions) if (typeof r.paint === 'string') r.paint = snap.get(r.paint) ?? r.paint;
+      // Yumuşak gölge/parıltı grupları: halka bölgeler yerine tek bulanık şekil
+    const softGroups = detectSoftGroups(seg, segImg, Math.max(6, Math.round(12 * s * s)));
+    const softOf = new Map<number, number>();
+    softGroups.forEach((g, gi) => g.ids.forEach((id) => softOf.set(id, gi)));
+    const keyOf = (r: Region) => (softOf.has(r.id) ? `soft${softOf.get(r.id)}` : typeof r.paint === 'string' ? r.paint : `g${r.id}`);
+      const groupIdx = new Map<string, number>();
+      const maxId = seg.regions.reduce((m, r) => Math.max(m, r.id), -1) + 1;
+      const regToLabel = new Int32Array(maxId).fill(-1);
+      fills = []; models = [];
+      for (const r of seg.regions) {
+        const key = keyOf(r);
+        let gi = groupIdx.get(key);
+        if (gi === undefined) {
+          gi = fills.length; groupIdx.set(key, gi);
+          const sg = softOf.has(r.id) ? softGroups[softOf.get(r.id)!] : null;
+          if (sg) {
+            fills.push(hex(sg.rgb.map(Math.round) as [number, number, number])); models.push('solid');
+            softByLabel.set(gi, { g: sg, s, segW: sw, segH: sh, labels: seg.labels, rgba: segImg.rgba });
+          } else { fills.push(scalePaint(r.paint, 1 / s)); models.push(r.model); }
+        }
+        regToLabel[r.id] = gi;
+      }
+      if (fills.length > 32000) throw new VectorError('UNSUPPORTED', `Görsel çok fazla bölge üretti (${fills.length}); ayrıntıyı düşürün (detail) veya photo preset kullanın`);
+      lab = new Int16Array(w * h);
+      for (let p = 0; p < w * h; p++) {
+        const v = seg.labels[p];
+        lab[p] = v < 0 || img.rgba[p * 4 + 3] < 8 ? -1 : regToLabel[v];
+      }
+      void sw; void sh;
+    } else {
+      // Normal/büyük görsel: segmentasyon kaynak çözünürlüğünde (≤1200 px), etiketler sınır iyileştirmeli büyütülür
+      // Segmentasyon orijinal çözünürlükte (büyütülmüş görselde kenarlar yumuşar); en çok 1200 px
+      const s = Math.min(1, 1200 / longSide);
+      const sw = Math.max(1, Math.round(W * s)), sh = Math.max(1, Math.round(H * s));
+      const segImg = resize(src, sw, sh);
+      // Eşikler gürültüye uyarlanır: temiz görselde düşük kontrastlı kenarlar da ayrılır, JPEG'de gürültü kenar sayılmaz
+      const nz = estimateNoise(probe);
+      const seg = segmentRegions(segImg, {
+        minArea: Math.max(6, Math.round(((1 - detail) * 30 + 6) * s * s)),
+        edge: Math.min(0.05, 0.018 + nz * 0.006),
+        // Eşikler yalnız ölçülen gürültüye bağlı (preset'e göre gevşetilmez: gradyanlı ikonlar da "photo" sınıflanabilir)
+        maxRms: Math.min(9, Math.max(3, 2.5 + nz * 1.5)),
+        outlier: Math.min(14, 5 + nz * 3),
+      });
+      // Aynı düz rengi paylaşan bölgeleri tek etikette topla (tek path, daha az node)
+      // Algısal olarak ayırt edilemeyen düz renkleri (ΔE_ok < 0.025) alanı en büyük temsilcide birleştir
+      const reps: { lab: [number, number, number]; hex: string }[] = [];
+      const snap = new Map<string, string>();
+      for (const r of [...seg.regions].sort((a, b) => b.area - a.area)) {
+        if (typeof r.paint !== 'string' || snap.has(r.paint)) continue;
+        const [R, G, B] = parseHex(r.paint.slice(0, 7));
+        if (r.paint.length > 7) { snap.set(r.paint, r.paint); continue; } // yarı saydamlar birleştirilmez
+        const c = rgbToOklab(R, G, B);
+        const hit = reps.find((q) => (q.lab[0] - c[0]) ** 2 + (q.lab[1] - c[1]) ** 2 + (q.lab[2] - c[2]) ** 2 < 0.025 ** 2);
+        if (hit) snap.set(r.paint, hit.hex); else { reps.push({ lab: c, hex: r.paint }); snap.set(r.paint, r.paint); }
+      }
+      for (const r of seg.regions) if (typeof r.paint === 'string') r.paint = snap.get(r.paint) ?? r.paint;
+      // Yumuşak gölge/parıltı grupları: halka bölgeler yerine tek bulanık şekil
+    const softGroups = detectSoftGroups(seg, segImg, Math.max(6, Math.round(12 * s * s)));
+    const softOf = new Map<number, number>();
+    softGroups.forEach((g, gi) => g.ids.forEach((id) => softOf.set(id, gi)));
+    const keyOf = (r: Region) => (softOf.has(r.id) ? `soft${softOf.get(r.id)}` : typeof r.paint === 'string' ? r.paint : `g${r.id}`);
+      const groupIdx = new Map<string, number>();
+      const maxId = seg.regions.reduce((m, r) => Math.max(m, r.id), -1) + 1;
+      const regToLabel = new Int32Array(maxId).fill(-1);
+      fills = []; models = [];
+      for (const r of seg.regions) {
+        const key = keyOf(r);
+        let gi = groupIdx.get(key);
+        if (gi === undefined) {
+          gi = fills.length; groupIdx.set(key, gi);
+          const sg = softOf.has(r.id) ? softGroups[softOf.get(r.id)!] : null;
+          if (sg) {
+            fills.push(hex(sg.rgb.map(Math.round) as [number, number, number])); models.push('solid');
+            softByLabel.set(gi, { g: sg, s, segW: sw, segH: sh, labels: seg.labels, rgba: segImg.rgba });
+          } else { fills.push(scalePaint(r.paint, 1 / s)); models.push(r.model); }
+        }
+        regToLabel[r.id] = gi;
+      }
+      if (fills.length > 32000) throw new VectorError('UNSUPPORTED', `Görsel çok fazla bölge üretti (${fills.length}); ayrıntıyı düşürün (detail) veya photo preset kullanın`);
+      // Etiketleri çalışma çözünürlüğüne taşı. Sınır piksellerinde en-yakın-komşu merdiveni yerine: komşu segment
+      // bölgelerinden, boyası (o noktada değerlendirilmiş) büyütülmüş görüntü rengine en yakın olan seçilir.
+      const segPaint: Paint[] = new Array(maxId);
+      for (const r of seg.regions) segPaint[r.id] = r.paint;
+      lab = new Int16Array(w * h);
+      const cand: number[] = [];
+      for (let y = 0; y < h; y++) {
+        const fy = ((y + 0.5) * sh) / h, sy = Math.min(sh - 1, Math.floor(fy));
+        for (let x = 0; x < w; x++) {
+          const fx = ((x + 0.5) * sw) / w, sx = Math.min(sw - 1, Math.floor(fx));
+          const p = y * w + x;
+          if (img.rgba[p * 4 + 3] < 8) { lab[p] = -1; continue; }
+          cand.length = 0;
+          for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+            const xx = sx + dx, yy = sy + dy;
+            if (xx < 0 || yy < 0 || xx >= sw || yy >= sh) continue;
+            const v = seg.labels[yy * sw + xx];
+            if (v >= 0 && !cand.includes(v)) cand.push(v);
+          }
+          if (cand.length === 0) { lab[p] = -1; continue; }
+          let best = cand[0];
+          if (cand.length > 1) {
+            // Aday rengi = adayın boyasının bu noktadaki değeri (kaynak çözünürlüğü yolunda ölçümle en iyi sonuç)
+            let bd = Infinity;
+            for (const v of cand) {
+              const c = evalPaint(segPaint[v], fx, fy);
+              const dd = (c[0] - img.rgba[p * 4]) ** 2 + (c[1] - img.rgba[p * 4 + 1]) ** 2 + (c[2] - img.rgba[p * 4 + 2]) ** 2 + (c[3] - img.rgba[p * 4 + 3]) ** 2;
+              if (dd < bd) { bd = dd; best = v; }
+            }
+          }
+          lab[p] = regToLabel[best];
+        }
+      }
+    }
+  } else {
+    let pal: Palette;
+    if (o.palette?.length) pal = extractPalette(img, { fixed: o.palette.map(parseHex) });
+    else if (preset === 'lineart') pal = extractPalette(img, { k: o.colors ?? 2 });
+    else pal = extractPalette(img, { k: o.colors, maxK: o.maxColors ?? (preset === 'logo' ? 16 : preset === 'illustration' ? 32 : 48), targetError: preset === 'photo' ? 0.03 : 0.016 });
+    lab = labelize(img, pal);
+    lab = modeFilter(lab, w, h, detail > 0.8 ? 0 : 1);
+    speckles = removeSpeckles(lab, w, h, speckleArea);
+    fills = pal.rgb.map(hex);
+    models = fills.map(() => 'solid');
+  }
+  if (preset === 'photo') warnings.push('Fotoğraf benzeri görsel: sonuç çok sayıda şekil içerir ve fotoğrafik ayrıntı basitleşir. En iyi sonuç logo/illüstrasyon/çizimlerde alınır.');
 
   // Katman sırası: kapsama alanı büyükten küçüğe (en büyük altta)
-  const K = pal.colors.length;
+  const K = fills.length;
   const area = new Float64Array(K);
   for (let p = 0; p < w * h; p++) if (lab[p] >= 0) area[lab[p]]++;
-  const order = [...Array(K).keys()].filter((i) => area[i] > 0).sort((a, b) => area[b] - area[a]);
+  const order = [...Array(K).keys()].filter((i) => area[i] > 0).sort((a, b) => (softByLabel.has(b) ? 1 : 0) - (softByLabel.has(a) ? 1 : 0) || area[b] - area[a]);
   const rank = new Int16Array(K).fill(-1);
   order.forEach((ci, r) => { rank[ci] = r; });
 
@@ -247,9 +410,9 @@ export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions =
   const bgIdx = bcount ? [...border.keys()].sort((a, b) => border[b] - border[a])[0] : -1;
   const hasTransparency = lab.some((v) => v < 0);
   const bgMode = o.background ?? 'auto';
-  const bgIsLayer0 = bgIdx >= 0 && rank[bgIdx] === 0 && border[bgIdx] / bcount >= 0.6 && !hasTransparency;
+  const bgIsLayer0 = bgIdx >= 0 && rank[bgIdx] === 0 && border[bgIdx] / bcount >= 0.6 && !hasTransparency && typeof fills[bgIdx] === 'string';
   const dropBg = bgIsLayer0 && bgMode !== 'keep';
-  const background = bgIsLayer0 && bgMode === 'auto' ? hex(pal.rgb[bgIdx]) : null;
+  const background = bgIsLayer0 && bgMode === 'auto' ? (fills[bgIdx] as string) : null;
 
   // Parametreler (çalışma ölçeğinde)
   const cfg = {
@@ -261,54 +424,102 @@ export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions =
   const method = o.method ?? 'overlap';
   // Kenar yumuşatma yarıçapı: büyütme merdivenini (k) ve ölçülen gürültüyü bastırır; ayrıntı arttıkça küçülür
   const noise = estimateNoise(probe);
-  const blurR = Math.round(Math.max(0, (k > 1 ? 0.5 * k : 0) + Math.min(1.5, noise / 3) * k) * (1.2 - detail));
+  let blurR = Math.round(Math.max(0, (k > 1 ? 0.5 * k : 0) + Math.min(1.5, noise / 3) * k) * (1.2 - detail));
+  // Gradyan kipinde etiketler düşük çözünürlükten büyütülür: blok basamaklarını (≈k px) silecek kadar yumuşat
+  if (useGradients && k > 1) blurR = Math.max(blurR, Math.round(0.6 * k));
   const bleed = Math.max(1, Math.round(1.2 * k)); // taşma yarıçapı (çalışma pikseli)
   const fitTol = (0.25 + smooth * 0.5) * Math.max(1, k); // çalışma pikseli
   const layers: VNode[] = [];
   const palOut: TraceResult['palette'] = [];
   let anchors = 0, subpathCount = 0;
   const inv = 1 / k;
-  const mask = new Uint8Array(w * h);
+  // Etiket başına sınır kutusu (katman işlemleri yalnız bu kutuda yapılır → yüzlerce bölgede büyük hız kazancı)
+  const bb = Array.from({ length: K }, () => [w, h, -1, -1]);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const v = lab[y * w + x];
+    if (v < 0) continue;
+    const b = bb[v];
+    if (x < b[0]) b[0] = x; if (y < b[1]) b[1] = y; if (x > b[2]) b[2] = x; if (y > b[3]) b[3] = y;
+  }
+  const pad = bleed + 3 * blurR + 6;
+  const regionLabelBBox = (id: number): [number, number, number, number] | null => {
+    for (const info of softByLabel.values()) {
+      let x0 = Infinity, y0 = Infinity, x1 = -1, y1 = -1;
+      for (let q = 0; q < info.labels.length; q++) if (info.labels[q] === id) { const x = q % info.segW, y = (q / info.segW) | 0; if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y; }
+      if (x1 < 0) continue;
+      const fx = w / info.segW, fy = h / info.segH;
+      return [Math.floor(x0 * fx), Math.floor(y0 * fy), Math.min(w - 1, Math.ceil((x1 + 1) * fx)), Math.min(h - 1, Math.ceil((y1 + 1) * fy))];
+    }
+    return null;
+  };
+  // Yarı saydam boyalar (fillOpacity<1 ya da opaklıklı gradyan durağı): taşma yapılmaz ve altlarına taşırılmaz
+  // (üst üste binen yarı saydamlık iki kat koyulaşır)
+  // (ölçüm: yalnız bulanık yumuşak katmanlarda gerekli; kenar yumuşatma halkalarında taşma daha doğru sonuç veriyor)
+  const translucent = new Uint8Array(K);
+  for (const i of softByLabel.keys()) translucent[i] = 1;
   for (let r = 0; r < order.length; r++) {
     const ci = order[r];
     if (dropBg && ci === bgIdx) continue;
-    for (let p = 0; p < w * h; p++) {
-      const v = lab[p];
-      mask[p] = v < 0 ? 0 : method === 'stacked' ? (rank[v] >= r ? 1 : 0) : (v === ci ? 1 : 0);
+    let [bx0, by0, bx1, by1] = bb[ci];
+    const softInfo = softByLabel.get(ci);
+    if (softInfo) for (const id of softInfo.g.shapeIds) { const lb = regionLabelBBox(id); if (lb) { bx0 = Math.min(bx0, lb[0]); by0 = Math.min(by0, lb[1]); bx1 = Math.max(bx1, lb[2]); by1 = Math.max(by1, lb[3]); } }
+    if (method === 'stacked') for (let q = r; q < order.length; q++) { const o2 = bb[order[q]]; bx0 = Math.min(bx0, o2[0]); by0 = Math.min(by0, o2[1]); bx1 = Math.max(bx1, o2[2]); by1 = Math.max(by1, o2[3]); }
+    bx0 = Math.max(0, bx0 - pad); by0 = Math.max(0, by0 - pad); bx1 = Math.min(w - 1, bx1 + pad); by1 = Math.min(h - 1, by1 + pad);
+    const cw = bx1 - bx0 + 1, chh = by1 - by0 + 1;
+    const cLab = new Int16Array(cw * chh);
+    const mask = new Uint8Array(cw * chh);
+    for (let y = 0; y < chh; y++) for (let x = 0; x < cw; x++) {
+      const v = lab[(y + by0) * w + x + bx0];
+      cLab[y * cw + x] = v;
+      mask[y * cw + x] = v < 0 ? 0 : method === 'stacked' ? (rank[v] >= r ? 1 : 0) : (v === ci ? 1 : 0);
     }
-    if (method === 'overlap') dilateInto(mask, lab, rank, r, w, h, bleed);
-    smoothMask(mask, w, h, blurR);
-    let sps = await traceMask(mask, w, h, cfg);
-    if (process.env.MV_TRACE_DEBUG) console.error('vtracer', ci, sps.map((sp) => sp.points.length));
+    const soft = softByLabel.get(ci);
+    if (soft) {
+      // Şekil maskesi: grup pikselleri (yarı-alfa üstü) ∪ gölgeyi düşüren opak bölgeler — segmentasyondan en-yakın örnekle
+      for (let y = 0; y < chh; y++) {
+        const sy = Math.min(soft.segH - 1, Math.floor(((y + by0 + 0.5) * soft.segH) / h));
+        for (let x = 0; x < cw; x++) {
+          const sx = Math.min(soft.segW - 1, Math.floor(((x + bx0 + 0.5) * soft.segW) / w));
+          const q = sy * soft.segW + sx, v = soft.labels[q];
+          mask[y * cw + x] = v >= 0 && soft.g.shapeIds.has(v) && (!soft.g.ids.has(v) || soft.rgba[q * 4 + 3] >= soft.g.halfAlpha) ? 1 : 0;
+        }
+      }
+    } else if (method === 'overlap' && !translucent[ci]) dilateInto(mask, cLab, rank, r, cw, chh, bleed, translucent);
+    smoothMask(mask, cw, chh, blurR);
+    let sps = (await traceMask(mask, cw, chh, cfg)).map((sp) => transformSubPath(sp, { a: 1, b: 0, c: 0, d: 1, e: bx0, f: by0 }));
     // Düzeltme + çapa azaltma (uydurma), sonra orijinal ölçeğe
     sps = sps.map((sp) => {
       const st = straighten(sp, 0.35 * Math.max(1, k));
       if (st.points.length < 8) return st;
       const [poly] = flattenSubPaths([st], 0.15);
       const fitted = fitClosedPolygon(poly, fitTol, 40 + smooth * 20, false, Math.max(3 * Math.max(1, k), 2 * blurR + 2));
-      if (process.env.MV_TRACE_DEBUG) console.error('  vt', sp.points.length, 'str', st.points.length, 'fit', fitted.points.length);
       return fitted.points.length >= 3 && fitted.points.length < st.points.length ? straighten(fitted, 0.35 * Math.max(1, k)) : st;
     }).map((sp) => {
       const b = subpathsBBox([sp]);
       const diag = Math.hypot(b.maxX - b.minX, b.maxY - b.minY);
-      const out = sharpenCorners(sp, Math.max(4 * Math.max(1, k), Math.min(30 * Math.max(1, k), 0.035 * diag)));
-      if (process.env.MV_TRACE_DEBUG) console.error('  sharpen', sp.points.length, '→', out.points.length, 'lines', sp.points.filter((p, i, a) => !p.out && !a[(i + 1) % a.length].in).length);
-      return out;
+      return sharpenCorners(sp, Math.max(4 * Math.max(1, k), Math.min(30 * Math.max(1, k), 0.035 * diag)));
     }).map((sp) => transformSubPath(sp, { a: inv, b: 0, c: 0, d: inv, e: 0, f: 0 }));
     if (!sps.length) continue;
-    const color = hex(pal.rgb[ci]);
+    let fill = fills[ci];
+    let fillOpacity: number | undefined;
+    if (typeof fill === 'string' && /^#[0-9a-f]{8}$/i.test(fill)) { fillOpacity = Math.round((parseInt(fill.slice(7), 16) / 255) * 1000) / 1000; fill = fill.slice(0, 7); }
+    const color = typeof fill === 'string' ? fill : fill.stops[0].color;
     const nA = sps.reduce((s, sp) => s + sp.points.length, 0);
     anchors += nA; subpathCount += sps.length;
+    const label = softInfo ? `Yumuşak gölge ${r + 1} ${color}` : typeof fill === 'string' ? `Renk ${r + 1} ${color}` : `Gradyan ${r + 1} (${fill.type}, ${fill.stops.length} durak)`;
     const node: PathNode = {
-      type: 'path', id: newId('path'), name: `Renk ${r + 1} ${color}`, transform: { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
-      style: defaultStyle({ fill: color }), visible: true, locked: false, subpaths: sps.map((sp) => ({ ...sp, points: sp.points.map(round3) })), fillRule: 'evenodd',
+      type: 'path', id: newId('path'), name: label, transform: { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
+      style: defaultStyle({
+        fill, ...(fillOpacity !== undefined ? { fillOpacity } : {}),
+        ...(softInfo ? { opacity: Math.round(softInfo.g.alpha * 1000) / 1000, filters: [{ type: 'blur' as const, radius: Math.round(((2 * softInfo.g.sigma) / softInfo.s) * 100) / 100 }] } : {}),
+      }), visible: true, locked: false, subpaths: sps.map((sp) => ({ ...sp, points: sp.points.map(round3) })), fillRule: 'evenodd',
     };
     layers.push(node);
-    palOut.push({ color, coverage: Math.round((10000 * area[ci]) / (w * h)) / 100, paths: sps.length, anchors: nA });
+    palOut.push({ color, coverage: Math.round((10000 * area[ci]) / (w * h)) / 100, paths: sps.length, anchors: nA, ...(models[ci] !== 'solid' ? { gradient: models[ci] as 'linear' | 'radial' } : {}) });
   }
   if (!layers.length) warnings.push('İzlenecek içerik bulunamadı (görsel tek renk veya tamamen saydam olabilir)');
   const group: GroupNode = {
-    type: 'group', id: newId('group'), name: `Vektör izleme (${preset}, ${layers.length} renk)`, transform: { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
+    type: 'group', id: newId('group'), name: `Vektör izleme (${preset}, ${layers.length} ${useGradients ? 'bölge' : 'renk'})`, transform: { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
     style: defaultStyle({ fill: 'none' }), visible: true, locked: false, children: layers,
   };
   return {
@@ -363,7 +574,7 @@ function smoothMask(mask: Uint8Array, w: number, h: number, r: number) {
 }
 
 /** Maskeyi yalnız ÜST sıradaki renklerin piksellerine doğru `radius` kadar genişlet (alt katman üsttekinin altına girer). */
-function dilateInto(mask: Uint8Array, lab: Int16Array, rank: Int16Array, r: number, w: number, h: number, radius: number) {
+function dilateInto(mask: Uint8Array, lab: Int16Array, rank: Int16Array, r: number, w: number, h: number, radius: number, translucent?: Uint8Array) {
   let frontier: number[] = [];
   for (let p = 0; p < w * h; p++) if (mask[p]) frontier.push(p);
   for (let step = 0; step < radius; step++) {
@@ -374,11 +585,18 @@ function dilateInto(mask: Uint8Array, lab: Int16Array, rank: Int16Array, r: numb
       for (const q of nb) {
         if (q < 0 || mask[q]) continue;
         const v = lab[q];
-        if (v >= 0 && rank[v] > r) { mask[q] = 1; next.push(q); }
+        if (v >= 0 && rank[v] > r && !translucent?.[v]) { mask[q] = 1; next.push(q); }
       }
     }
     frontier = next;
   }
+}
+
+/** Boya koordinatlarını ölçekle (segmentasyon pikseli → orijinal piksel). */
+function scalePaint(p: Paint, f: number): Paint {
+  if (typeof p === 'string' || f === 1) return p;
+  if (p.type === 'linear') return { ...p, x1: p.x1 * f, y1: p.y1 * f, x2: p.x2 * f, y2: p.y2 * f };
+  return { ...p, cx: p.cx * f, cy: p.cy * f, r: p.r * f, ...(p.fx !== undefined ? { fx: p.fx * f } : {}), ...(p.fy !== undefined ? { fy: p.fy * f } : {}) };
 }
 
 const r3 = (v: number) => Math.round(v * 1000) / 1000;

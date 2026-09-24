@@ -129,4 +129,23 @@ describe('raster izleme', () => {
     const m = compareDocument(doc, { rgba: x.getImageData(0, 0, 300, 200).data, width: 300, height: 200 }).metrics;
     expect(m.pctOff).toBeLessThan(0.5);
   }, 60_000);
+
+  it('gradyanlı illüstrasyon: gradyanlar gerçek doğrusal/radyal gradyan olarak geri kazanılır', async () => {
+    const r = await vectorizeImageToDoc(readFileSync(path.join(FX, 'illustration.png')));
+    expect(r.report.fidelity!.pctOff).toBeLessThan(0.3);
+    const grads = vectorPaths(r.doc).filter((p) => typeof p.style.fill !== 'string');
+    expect(grads.some((p) => (p.style.fill as any).type === 'linear')).toBe(true);
+    expect(grads.some((p) => (p.style.fill as any).type === 'radial')).toBe(true);
+  }, 120_000);
+
+  it('yarı saydam yumuşak gölge korunur (alfa gradyanı / fillOpacity)', async () => {
+    const c = createCanvas(240, 240); const x = c.getContext('2d');
+    x.shadowColor = 'rgba(0,0,0,0.5)'; x.shadowBlur = 16; x.shadowOffsetY = 6;
+    x.fillStyle = '#2a9d8f'; x.beginPath(); x.roundRect(40, 30, 160, 160, 28); x.fill();
+    const buf = c.toBuffer('image/png');
+    const r = await vectorizeImageToDoc(buf);
+    const hasAlpha = vectorPaths(r.doc).some((p) => (p.style.fillOpacity ?? 1) < 1 || (typeof p.style.fill !== 'string' && p.style.fill.stops.some((s) => (s.opacity ?? 1) < 1)));
+    expect(hasAlpha).toBe(true);
+    expect(r.report.fidelity!.pctOff).toBeLessThan(1);
+  }, 120_000);
 });

@@ -6,17 +6,21 @@ import { createDocument } from '../model/scene.js';
 import { decodeImageBuffer, type DecodedImage } from '../render/png.js';
 import { rgbaToDataUri } from '../render/image-ops.js';
 import { traceImage, type TraceOptions, type TraceResult } from './trace.js';
-import { compareDocument, type CompareMetrics } from './compare.js';
+import { compareDocument, median3, type CompareMetrics } from './compare.js';
 import { importPDF, type PdfImportOptions } from './pdf.js';
 
 // Üst düzey vektörleştirme API'si: Document Server, MCP ve CLI aynı fonksiyonları kullanır.
 
 export const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i;
+/** JPEG veya kayıplı WebP (VP8) mi? */
+export const isLossy = (buf: Buffer) => (buf[0] === 0xff && buf[1] === 0xd8) || (buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 16) === 'WEBPVP8 ');
 export const isPdf = (file: string, buf?: Buffer) => /\.pdf$/i.test(file) || (!!buf && buf.subarray(0, 5).toString('latin1') === '%PDF-');
 
 export interface VectorizeImageOptions extends TraceOptions {
   /** Kalite hedefi karşılanmazsa parametreleri ayarlayıp yeniden dene (varsayılan true). */
   refine?: boolean;
+  /** Kaynak kayıplı sıkıştırılmış (JPEG/kayıplı WebP): ölçüt gürültüsü giderilmiş kaynağa karşı yapılır. */
+  lossySource?: boolean;
   /** Kaynak görseli kilitli+gizli "Referans" katmanı olarak ekle (varsayılan true). */
   keepReference?: boolean;
   name?: string;
@@ -49,21 +53,38 @@ const layer = (name: string, children: VNode[], extra: Partial<GroupNode> = {}):
 /** İzle + doğrula; gerekirse ayarları sıkılaştırıp tekrar dene ve en iyisini seç. */
 export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}) {
   const attempts: VectorizeReport['attempts'] = [];
+  let ref: { rgba: Uint8ClampedArray; width: number; height: number } | null = null;
+  let refKind: 'kaynak' | 'gürültüsü giderilmiş kaynak' = 'kaynak';
   const evaluate = async (opts: TraceOptions) => {
     const r = await traceImage(img, opts);
+    // Gürültülü kaynakta (JPEG vb.) ölçüt, gürültüyü değil şekli ölçsün: 3×3 medyanla temizlenmiş kaynağa karşı
+    if (!ref) {
+      if (r.stats.noise > 0.5 || o.lossySource) { ref = { rgba: median3(img.rgba, img.width, img.height), width: img.width, height: img.height }; refKind = 'gürültüsü giderilmiş kaynak'; }
+      else ref = { rgba: img.rgba, width: img.width, height: img.height };
+    }
     const doc = createDocument('t', r.width, r.height);
     const f = doc.pages[0].frames[0];
     f.background = r.background ?? 'none';
     f.nodes = [r.group];
-    const m = compareDocument(doc, { rgba: img.rgba, width: img.width, height: img.height }).metrics;
-    attempts.push({ options: { colors: opts.colors, detail: opts.detail, maxColors: opts.maxColors, smoothness: opts.smoothness }, pctOff: m.pctOff, anchors: r.stats.anchors });
+    const m = { ...compareDocument(doc, ref).metrics, reference: refKind };
+    attempts.push({ options: { colors: opts.colors, detail: opts.detail, maxColors: opts.maxColors, smoothness: opts.smoothness, gradients: opts.gradients }, pctOff: m.pctOff, anchors: r.stats.anchors });
     return { r, m };
   };
+  // Palet (düz renk) ve gradyan kiplerini ikisini de dene, ölçüte göre seç (sınıflandırma yanılabilir)
   let best = await evaluate(o);
+  if (o.gradients === undefined && !o.palette?.length) {
+    const usedGradients = best.r.group.children.some((c) => c.type === 'path' && typeof c.style.fill !== 'string') || /bölge/.test(best.r.group.name ?? '');
+    const alt = await evaluate({ ...o, gradients: !usedGradients });
+    // Daha basit sonuç (daha az çapa) tercih edilir; karmaşık olan ancak hatayı belirgin VE mutlak olarak azaltıyorsa seçilir
+    const [simple, complex] = alt.r.stats.anchors <= best.r.stats.anchors ? [alt, best] : [best, alt];
+    const complexWins = complex.m.pctOff < simple.m.pctOff * 0.6 && simple.m.pctOff - complex.m.pctOff > 0.3;
+    const better = (complexWins ? complex : simple) === alt;
+    if (better) best = alt;
+  }
   if (o.refine !== false && !o.palette?.length && best.m.pctOff > 0.5 && best.r.preset !== 'photo') {
     const tries: TraceOptions[] = [
-      { ...o, detail: Math.min(1, (o.detail ?? 0.6) + 0.25) },
-      { ...o, detail: Math.min(1, (o.detail ?? 0.6) + 0.25), maxColors: Math.round((o.maxColors ?? 16) * 1.75), colors: o.colors ? o.colors + 2 : undefined },
+      { ...o, gradients: best.r.group.name?.includes('bölge'), detail: Math.min(1, (o.detail ?? 0.6) + 0.25) },
+      { ...o, gradients: best.r.group.name?.includes('bölge'), detail: Math.min(1, (o.detail ?? 0.6) + 0.25), maxColors: Math.round((o.maxColors ?? 16) * 1.75), colors: o.colors ? o.colors + 2 : undefined },
     ];
     for (const t of tries) {
       const c = await evaluate(t);
@@ -79,7 +100,7 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
 export async function vectorizeImageToDoc(buf: Buffer, o: VectorizeImageOptions & { title?: string } = {}): Promise<{ doc: VDocument; report: VectorizeReport; vectorGroupId: string; referenceId: string | null }> {
   const img = decodeImageBuffer(buf);
   if (!img) throw new VectorError('INVALID_ARGUMENT', 'Görsel çözülemedi (PNG, JPEG, WebP, GIF, BMP, TIFF desteklenir)');
-  const { r, m, attempts } = await traceBest(img, o);
+  const { r, m, attempts } = await traceBest(img, { lossySource: isLossy(buf), ...o });
   const doc = createDocument(o.title ?? 'Vektörleştirilmiş görsel', r.width, r.height);
   const frame = doc.pages[0].frames[0];
   frame.background = r.background ?? 'none';
@@ -99,7 +120,7 @@ export async function vectorizeImageToDoc(buf: Buffer, o: VectorizeImageOptions 
 export async function vectorizeImageAsGroup(buf: Buffer, o: VectorizeImageOptions & { placement?: { x: number; y: number; width?: number; height?: number } } = {}) {
   const img = decodeImageBuffer(buf);
   if (!img) throw new VectorError('INVALID_ARGUMENT', 'Görsel çözülemedi');
-  const { r, m, attempts } = await traceBest(img, o);
+  const { r, m, attempts } = await traceBest(img, { lossySource: isLossy(buf), ...o });
   const p = o.placement ?? { x: 0, y: 0 };
   const sx = p.width ? p.width / r.width : p.height ? p.height / r.height : 1;
   const sy = p.height && p.width ? p.height / r.height : sx;
