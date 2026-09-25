@@ -363,11 +363,15 @@ export class DocumentEngine {
   /** Raster görseli vektöre çevir. replace: yeni belge (Referans+Vektör katmanı); merge: mevcut belgeye grup. */
   async vectorizeImage(ctx: CallContext, p: VectorizeImageOptions & { path?: string; data?: string; mode?: 'replace' | 'merge'; parentId?: string; placement?: { x: number; y: number; width?: number; height?: number }; expectedVersion?: number }) {
     this.assertCanWrite(ctx, p.expectedVersion);
+    // parentId/placement yalnız merge'de anlamlı: mod verilmemişse merge'e düş; açık replace ile birlikteyse
+    // belgeyi sessizce silmek yerine hata ver (replace TÜM belgeyi değiştirir).
+    const mode = p.mode ?? (p.parentId || p.placement ? 'merge' : 'replace');
+    if (mode === 'replace' && (p.parentId || p.placement)) throw invalid('vectorize_image: parentId/placement yalnız mode="merge" ile kullanılır (replace tüm belgeyi değiştirir)');
     const { buf, name, file } = await this.readInput(p);
     if (isPdf(file ?? '', buf)) {
-      return this.importPdf(ctx, file ? { path: p.path!, mode: p.mode === 'merge' ? 'append' : 'replace' } : { data: buf.toString('base64'), mode: p.mode === 'merge' ? 'append' : 'replace' });
+      return this.importPdf(ctx, file ? { path: p.path!, mode: mode === 'merge' ? 'append' : 'replace' } : { data: buf.toString('base64'), mode: mode === 'merge' ? 'append' : 'replace' });
     }
-    if (p.mode === 'merge') {
+    if (mode === 'merge') {
       const { group, report } = await vectorizeImageAsGroup(buf, { ...p, name: p.name ?? `${name} (vektör)` });
       return this.mutate(ctx, 'vectorize_image(merge)', (d) => {
         const target = p.parentId ? containerChildren(d, p.parentId) : { list: findFrame(d).frame.nodes };

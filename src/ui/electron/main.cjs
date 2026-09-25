@@ -86,15 +86,35 @@ function addToClaudeDesktop(entry) {
   return targets.length ? targets : [all[0]];
 }
 
+// claude CLI'ını bul: PATH'teki claude.exe → Claude Desktop'ın paketli CLI'ı (Store + klasik kurulum) →
+// son çare PATH'teki .cmd betiği (cmd.exe ile, shell:true olmadan: DEP0190 yok, tırnaklama bizde).
+function findClaude() {
+  if (process.platform !== 'win32') return { file: 'claude', pre: [] };
+  for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
+    const exe = dir && path.join(dir, 'claude.exe');
+    if (exe && fs.existsSync(exe)) return { file: exe, pre: [] };
+  }
+  const roots = [path.join(process.env.APPDATA ?? '', 'Claude', 'claude-code')];
+  const pk = path.join(process.env.LOCALAPPDATA ?? '', 'Packages');
+  try { for (const d of fs.readdirSync(pk)) if (/^Claude_/i.test(d)) roots.push(path.join(pk, d, 'LocalCache', 'Roaming', 'Claude', 'claude-code')); } catch {}
+  const cands = [];
+  for (const r of roots) {
+    try { for (const v of fs.readdirSync(r)) { const exe = path.join(r, v, 'claude.exe'); if (fs.existsSync(exe)) cands.push({ exe, t: fs.statSync(exe).mtimeMs }); } } catch {}
+  }
+  cands.sort((a, b) => b.t - a.t);
+  if (cands.length) return { file: cands[0].exe, pre: [] };
+  return { file: process.env.ComSpec || 'cmd.exe', pre: ['/d', '/s', '/c'], cmd: true };
+}
+
 function claudeCli(args) {
   return new Promise((resolve, reject) => {
-    // Windows'ta claude bir .cmd kabuk betiği olabilir → shell gerekir
-    // shell kipinde Node argümanları tırnaklamaz: boşluklu yollar (C:\Users\…\Programs\MasVector) elle tırnaklanır
-    const win32 = process.platform === 'win32';
-    execFile('claude', win32 ? args.map(quote) : args, { shell: win32, windowsHide: true, timeout: 30_000 }, (e, out, err) => {
+    const c = findClaude();
+    // cmd.exe yolu: tüm komut satırı tek argüman, Node'un kendi tırnaklaması kapalı
+    const argv = c.cmd ? [...c.pre, `"claude ${args.map(quote).join(' ')}"`] : args;
+    execFile(c.file, argv, { windowsHide: true, windowsVerbatimArguments: !!c.cmd, timeout: 30_000 }, (e, out, err) => {
       if (!e) return resolve(String(out).trim());
       const msg = `${err ?? ''}${out ?? ''}`;
-      if (e.code === 'ENOENT' || /not recognized|not found|bulunamad/i.test(msg)) reject(Object.assign(new Error("claude komutu bulunamadı (Claude Code kurulu değil ya da PATH'te değil). 'Ayarları kopyala' ile komutu alıp elle çalıştırabilirsiniz."), { code: 'ENOENT' }));
+      if (e.code === 'ENOENT' || /not recognized|not found|bulunamad|tanınmıyor/i.test(msg)) reject(Object.assign(new Error("claude komutu bulunamadı (Claude Code kurulu değil ya da PATH'te değil). 'Ayarları kopyala' ile komutu alıp elle çalıştırabilirsiniz."), { code: 'ENOENT' }));
       else reject(new Error(msg.trim() || e.message));
     });
   });
@@ -138,7 +158,7 @@ async function connectClaude() {
 }
 
 function menu() {
-  const guard = (fn) => async () => { try { await fn(); } catch (e) { dialog.showErrorBox('MasVector', String(e.message ?? e)); } };
+  const guard = (fn) => async () => { try { await fn(); } catch (e) { dialog.showMessageBox(win, { type: 'error', title: 'MasVector — Hata', message: String(e.message ?? e) }); } };
   return Menu.buildFromTemplate([
     {
       label: 'Dosya',
@@ -186,8 +206,9 @@ function menu() {
   ]);
 }
 
-ipcMain.handle('save-export', async (_e, format, url) => {
-  const r = await dialog.showSaveDialog(win, { defaultPath: path.join(WORKSPACE, `tasarim.${format}`), filters: [{ name: format.toUpperCase(), extensions: [format] }] });
+ipcMain.handle('save-export', async (_e, format, url, name) => {
+  const stem = String(name || 'tasarim').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || 'tasarim';
+  const r = await dialog.showSaveDialog(win, { defaultPath: path.join(WORKSPACE, `${stem}.${format}`), filters: [{ name: format.toUpperCase(), extensions: [format] }] });
   if (r.canceled || !r.filePath) return null;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Dışa aktarma başarısız: HTTP ${res.status}`);

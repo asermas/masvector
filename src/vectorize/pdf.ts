@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { copyFile, mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -32,6 +32,14 @@ const PDIR = process.platform === 'win32' ? popplerDir() : process.env.MASVECTOR
 const POPPLER_ENV = PDIR && existsSync(path.join(PDIR, '..', 'etc', 'fonts', 'fonts.conf'))
   ? { ...process.env, FONTCONFIG_FILE: path.join(PDIR, '..', 'etc', 'fonts', 'fonts.conf') }
   : process.env;
+/** Poppler aracının çalıştırılabilir yolu (paketli dizin ya da PATH'teki ad) ve ortamı. */
+export const popplerBin = (bin: string) => (PDIR ? path.join(PDIR, bin + EXE) : bin);
+export const popplerEnv = () => POPPLER_ENV;
+/** Poppler kullanılabilir mi (paketli ya da PATH'te)? Testler ve tanılama için. */
+export function popplerAvailable(): boolean {
+  try { execFileSync(PDIR ? path.join(PDIR, `pdftocairo${EXE}`) : 'pdftocairo', ['-v'], { stdio: 'ignore', env: POPPLER_ENV, windowsHide: true }); return true; }
+  catch { return false; }
+}
 const run = (bin: string, args: string[], o: { maxBuffer?: number; timeout?: number; cwd?: string } = {}) =>
   execP(PDIR ? path.join(PDIR, bin + EXE) : bin, args, { ...o, env: POPPLER_ENV, windowsHide: true });
 

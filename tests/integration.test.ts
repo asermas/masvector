@@ -36,7 +36,8 @@ async function agent(name: string) {
   const call = async (tool: string, args: Record<string, unknown> = {}) => {
     const r: any = await client.callTool({ name: tool, arguments: args });
     const t = r.content.find((c: any) => c.type === 'text')?.text;
-    return { raw: r, isError: !!r.isError, json: t ? JSON.parse(t) : undefined };
+    let json: any; try { json = t ? JSON.parse(t) : undefined; } catch { json = { error: t }; }
+    return { raw: r, isError: !!r.isError, json };
   };
   return { client, call };
 }
@@ -288,3 +289,60 @@ describe('MCP: PDF / görsel → vektör', () => {
   }, 180_000);
 });
 
+
+describe('v1.1 regresyonları (Windows test raporu)', () => {
+  it('H3: vectorize_image parentId ile mod verilmezse merge olur; replace + parentId belgeyi silmez, hata verir', async () => {
+    const { copyFileSync } = await import('node:fs');
+    copyFileSync(path.resolve('tests/fixtures/logo.png'), path.join(workspace, 'logo2.png'));
+    const a = await agent('h3');
+    await a.call('doc_create', { title: 'H3', width: 400, height: 300 });
+    const f2 = (await a.call('frame_create', { name: 'İkinci', w: 300, h: 200, x: 500, y: 0 })).json.result;
+    const layer = (await a.call('layer_create', { name: 'L', frameId: f2.id })).json.result;
+    const framesBefore = engine.doc.pages[0].frames.map((f) => f.id);
+    const bad = await a.call('vectorize_image', { path: 'logo2.png', mode: 'replace', parentId: layer.id });
+    expect(bad.isError).toBe(true);
+    expect(engine.doc.pages[0].frames.map((f) => f.id)).toEqual(framesBefore);
+    const ok = await a.call('vectorize_image', { path: 'logo2.png', parentId: layer.id });
+    expect(ok.isError).toBe(false);
+    expect(engine.doc.pages[0].frames.map((f) => f.id)).toEqual(framesBefore);
+    expect(mustLocate(engine.doc, ok.json.result.id).ancestors.map((g) => g.id)).toContain(layer.id);
+    await a.client.close();
+  }, 120_000);
+
+  it('ids bekleyen operasyonlar tekil id kısayolunu kabul eder (MCP + batch)', async () => {
+    const a = await agent('idalias');
+    await a.call('doc_create', { title: 'id', width: 100, height: 100 });
+    const r1 = (await a.call('node_add_rect', { x: 0, y: 0, width: 5, height: 5 })).json.result;
+    const r2 = (await a.call('node_add_rect', { x: 0, y: 0, width: 5, height: 5 })).json.result;
+    expect((await a.call('node_delete', { id: r1.id })).isError).toBe(false);
+    expect((await a.call('batch', { ops: [{ op: 'node_move', args: { id: r2.id, dx: 3, dy: 0 } }] })).isError).toBe(false);
+    expect(engine.nodeList({}).map((n: any) => n.id)).not.toContain(r1.id);
+    await a.client.close();
+  });
+});
+
+describe('vectorize CLI kaynağı korur (H1)', () => {
+  const cli = async (args: string[]) => {
+    const { execFile } = await import('node:child_process');
+    return new Promise<{ code: number; out: string; err: string }>((res) => {
+      execFile(process.execPath, ['--import', 'tsx', path.resolve('src/bin/vectorize.ts'), ...args], { timeout: 120_000 }, (e, out, err) =>
+        res({ code: e ? (e as any).code ?? 1 : 0, out: String(out), err: String(err) }));
+    });
+  };
+  it('x.png + --formats png: girdi ezilmez, çıktı x-vektor.png olur; --out girdiye çakışırsa hata', async () => {
+    const { copyFileSync, statSync } = await import('node:fs');
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'mv-cli-'));
+    const src = path.join(dir, 'logo.png');
+    copyFileSync(path.resolve('tests/fixtures/logo.png'), src);
+    const before = readFileSync(src);
+    const r = await cli([src, '--formats', 'svg,png']);
+    expect(r.code).toBe(0);
+    expect(readFileSync(src).equals(before)).toBe(true);
+    expect(existsSync(path.join(dir, 'logo-vektor.png'))).toBe(true);
+    expect(existsSync(path.join(dir, 'logo-vektor.svg'))).toBe(true);
+    const bad = await cli([src, '--formats', 'png', '--out', src]);
+    expect(bad.code).toBe(2);
+    expect(readFileSync(src).equals(before)).toBe(true);
+    expect(statSync(src).size).toBe(before.length);
+  }, 180_000);
+});

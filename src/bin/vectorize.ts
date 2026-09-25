@@ -14,7 +14,7 @@ import type { VDocument } from '../common/types.js';
 
 const args = parseArgs();
 // İlk konumsal argüman = girdi (değer alan --seçeneklerin değerleri atlanır)
-const FLAGS = new Set(['help', 'diff', 'no-reference']);
+const FLAGS = new Set(['help', 'diff', 'no-reference', 'overwrite']);
 let input: string | undefined;
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
@@ -26,7 +26,9 @@ if (args.help || !input) {
 
 Kullanım: masvector-vectorize <girdi.pdf|png|jpg|webp|...> [seçenekler]
 
-  --out YOL           Çıktı tabanı (varsayılan: girdi adı + .svg). Çok sayfalıda -s1, -s2 eklenir
+  --out YOL           Çıktı tabanı (varsayılan: girdi adı + .svg). Çok sayfalıda -s1, -s2 eklenir.
+                      Çıktı girdiyle aynı dosyaya düşerse varsayılan tabana -vektor eklenir
+  --overwrite         Çıktı girdi dosyasının üzerine yazabilir (açıkça istenmedikçe asla)
   --formats LISTE     svg,pdf,json,png (varsayılan: svg,json)
   --pages 1,3         PDF sayfaları (varsayılan: tümü)
   --preset P          auto|logo|illustration|lineart|photo
@@ -54,7 +56,18 @@ const trace: VectorizeImageOptions = {
 };
 const formats = new Set(String(args.formats ?? 'svg,json').split(',').map((s) => s.trim()));
 const abs = path.resolve(input);
-const base = typeof args.out === 'string' ? path.resolve(args.out).replace(/\.(svg|pdf|json|png)$/i, '') : abs.replace(/\.[^.]+$/, '');
+let base = typeof args.out === 'string' ? path.resolve(args.out).replace(/\.(svg|pdf|json|png)$/i, '') : abs.replace(/\.[^.]+$/, '');
+// Kaynağı koru: bir çıktı yolu girdiyle aynıysa (x.pdf + --formats pdf) asla sessizce ezme.
+const EXT: Record<string, string> = { svg: '.svg', pdf: '.pdf', png: '.png', json: '.masvector.json' };
+const norm = (p: string) => (process.platform === 'win32' ? p.toLowerCase() : p);
+const collides = (b: string) => [...formats].some((f) => EXT[f] && norm(b + EXT[f]) === norm(abs));
+if (!args.overwrite && collides(base)) {
+  if (typeof args.out === 'string') {
+    console.error(`Hata: çıktı girdi dosyasının üzerine yazar (${abs}). Başka bir --out verin ya da --overwrite ekleyin.`);
+    process.exit(2);
+  }
+  base += '-vektor';
+}
 await mkdir(path.dirname(base), { recursive: true });
 
 const t0 = Date.now();

@@ -22,6 +22,8 @@ const ctx = canvas.getContext('2d')! as Ctx;
 const state = {
   doc: null as VDocument | null,
   selection: [] as string[],
+  /** Tuvalde gösterilen frame; null = sayfanın ilk frame'i. */
+  frameId: null as string | null,
   tool: 'select' as Tool,
   cam: { z: 1, x: 40, y: 40 },
   dpr: window.devicePixelRatio || 1,
@@ -49,7 +51,15 @@ const colorOf = (a: string) => {
 
 // ———————————————————————————————— yardımcılar
 
-const frame = (): Frame | null => state.doc?.pages[0]?.frames[0] ?? null;
+const frames = (): Frame[] => state.doc?.pages[0]?.frames ?? [];
+const frame = (): Frame | null => frames().find((f) => f.id === state.frameId) ?? frames()[0] ?? null;
+/** Yeni node'ların hedefi: aktif frame'in en üstteki açık katmanı, yoksa frame'in kendisi. */
+function targetParent(): string | undefined {
+  const f = frame();
+  if (!f) return undefined;
+  const layer = f.nodes.filter((n) => n.type === 'group' && n.isLayer).reverse().find((l) => l.visible && !l.locked);
+  return layer?.id ?? f.id;
+}
 /** frame uzayı → ekran px (CSS) */
 const viewM = (f: Frame): Matrix => multiply({ a: state.cam.z, b: 0, c: 0, d: state.cam.z, e: state.cam.x, f: state.cam.y }, translate(f.x, f.y));
 const toFrame = (sx: number, sy: number): Point => { const f = frame(); return f ? apply(invert(viewM(f)), { x: sx, y: sy }) : { x: sx, y: sy }; };
@@ -76,12 +86,12 @@ function selectionBBox(ids = state.selection): BBox | null {
 }
 
 let toastTimer = 0;
-function toast(msg: string, kind: 'error' | 'info' = 'error') {
+function toast(msg: string, kind: 'error' | 'info' = 'error', ms?: number) {
   const t = $('toast');
   t.textContent = msg;
   t.className = `toast show ${kind === 'info' ? 'info' : ''}`;
   clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => (t.className = 'toast'), kind === 'info' ? 1800 : 4200);
+  toastTimer = window.setTimeout(() => (t.className = 'toast'), ms ?? (kind === 'info' ? 3000 : 5000));
 }
 
 async function run<T>(p: Promise<T>): Promise<T | undefined> {
@@ -615,8 +625,8 @@ canvas.addEventListener('pointerup', async () => {
       if (Math.max(w, h) * state.cam.z < 3) { toast('Şekil çizmek için sürükleyin', 'info'); break; }
       const style = currentStyle();
       const res = dr.kind === 'line'
-        ? await run(api.op<{ id: string }>('node_add_line', { x1: r2(dr.a.x), y1: r2(dr.a.y), x2: r2(dr.b.x), y2: r2(dr.b.y), style: { stroke: style.stroke === 'none' ? '#111111' : style.stroke, strokeWidth: style.strokeWidth } }))
-        : await run(api.op<{ id: string }>(dr.kind === 'rect' ? 'node_add_rect' : 'node_add_ellipse', { x: r2(x), y: r2(y), width: r2(w), height: r2(h), style }));
+        ? await run(api.op<{ id: string }>('node_add_line', { parentId: targetParent(), x1: r2(dr.a.x), y1: r2(dr.a.y), x2: r2(dr.b.x), y2: r2(dr.b.y), style: { stroke: style.stroke === 'none' ? '#111111' : style.stroke, strokeWidth: style.strokeWidth } }))
+        : await run(api.op<{ id: string }>(dr.kind === 'rect' ? 'node_add_rect' : 'node_add_ellipse', { parentId: targetParent(), x: r2(x), y: r2(y), width: r2(w), height: r2(h), style }));
       if (res) { state.selection = [res.result.id]; setTool('select'); }
       break;
     }
@@ -692,6 +702,7 @@ async function finishPen() {
   if (!pen || pen.points.length < 2) return;
   const style = currentStyle();
   const r = await run(api.op<{ id: string }>('node_add_path', {
+    parentId: targetParent(),
     subpaths: [{ closed: pen.closed, points: pen.points.map((p) => ({ x: r2(p.x), y: r2(p.y), ...(p.in ? { in: { dx: r2(p.in.dx), dy: r2(p.in.dy) } } : {}), ...(p.out ? { out: { dx: r2(p.out.dx), dy: r2(p.out.dy) } } : {}) })) }],
     style: pen.closed ? style : { fill: 'none', stroke: style.stroke === 'none' ? '#111111' : style.stroke, strokeWidth: style.strokeWidth || 2 },
   }));
@@ -714,7 +725,7 @@ function openTextInput(sx: number, sy: number, p: Point, editId?: string) {
     if (existing) await run(api.op('node_update', { id: editId, props: { content: v } }));
     else {
       const s = currentStyle();
-      const r = await run(api.op<{ id: string }>('node_add_text', { x: r2(p.x), y: r2(p.y), content: v, fontSize: 24, style: { fill: s.fill === 'none' ? '#111111' : s.fill } }));
+      const r = await run(api.op<{ id: string }>('node_add_text', { parentId: targetParent(), x: r2(p.x), y: r2(p.y), content: v, fontSize: 24, style: { fill: s.fill === 'none' ? '#111111' : s.fill } }));
       if (r) { state.selection = [r.result.id]; setTool('select'); }
     }
   };
@@ -795,8 +806,12 @@ async function cmd(c: string) {
     case 'export-svg': case 'export-png': case 'export-pdf': {
       const fmt = c.slice(7) as 'svg' | 'png' | 'pdf';
       const bridge = (window as any).masvector;
-      if (bridge?.saveExport) { const p = await bridge.saveExport(fmt, api.exportUrl(fmt)); if (p) toast(`Dışa aktarıldı: ${p}`, 'info'); }
-      else { const a = document.createElement('a'); a.href = api.exportUrl(fmt, fmt === 'png' ? { scale: '2' } : {}); a.download = `${state.doc?.title ?? 'masvector'}.${fmt}`; a.click(); }
+      // Tuvalde görünen frame dışa aktarılır (çok frame'li belgede seçiciden seçilen)
+      const f = frame();
+      const q: Record<string, string> = f ? { frameId: f.id } : {};
+      const name = f && frames().length > 1 ? f.name : state.doc?.title ?? 'masvector';
+      if (bridge?.saveExport) { const p = await bridge.saveExport(fmt, api.exportUrl(fmt, q), name); if (p) toast(`Dışa aktarıldı: ${p}`, 'info'); }
+      else { const a = document.createElement('a'); a.href = api.exportUrl(fmt, fmt === 'png' ? { ...q, scale: '2' } : q); a.download = `${name}.${fmt}`; a.click(); }
       break;
     }
   }
@@ -812,19 +827,25 @@ $<HTMLInputElement>('vec-file').addEventListener('change', async (e) => {
   if (file.size > 60 * 1024 * 1024) { toast('Dosya çok büyük (en çok 60 MB)'); return; }
   const data = await new Promise<string>((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result)); r.onerror = () => rej(r.error); r.readAsDataURL(file); });
   const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+  // Belgede içerik varsa onay sor: değiştir ya da mevcut belgeye ekle (PDF → yeni frame, görsel → aktif frame'e grup)
+  const hasContent = frames().some((f) => f.nodes.some((n) => !(n.type === 'group' && n.isLayer && !n.children.length)));
+  const mode = !hasContent || confirm(`"${file.name}" vektörleştirilecek.
+
+Tamam: mevcut belgeyi DEĞİŞTİR (Ctrl+Z ile geri alınır)
+İptal: mevcut belgeye EKLE`) ? 'replace' : 'merge';
+  const title = file.name.replace(/\.[^.]+$/, '');
   toast(`${file.name} vektörleştiriliyor…`, 'info');
   const btn = document.querySelector<HTMLButtonElement>('[data-cmd="vectorize"]')!;
   btn.disabled = true;
   try {
-    const r: any = await run(isPdf ? api.rpc('pdf_import', { data, mode: 'replace', name: file.name.replace(/\.[^.]+$/, '') }) : api.rpc('vectorize_image', { data, mode: 'replace', name: file.name.replace(/\.[^.]+$/, '') }));
+    const r: any = await run(isPdf ? api.rpc('pdf_import', { data, mode: mode === 'merge' ? 'append' : 'replace', name: title }) : api.rpc('vectorize_image', mode === 'merge' ? { data, mode, parentId: targetParent(), name: title } : { data, mode, name: title }));
     if (!r) return;
     const reps = isPdf ? r.result.imported : [{ ...r.result.report, page: 1 }];
     const worst = reps.reduce((m: any, x: any) => (!m || (x.fidelity?.pctOff ?? 0) > (m.fidelity?.pctOff ?? 0) ? x : m), null);
     const f = worst?.fidelity;
-    toast(`Tamam: ${reps.length} sayfa · sadakat ${f ? `${f.verdict} (%${f.pctOff} fark)` : '—'} · "Referans" katmanını açıp karşılaştırabilirsiniz`, 'info');
-    state.fitted = false;
+    toast(`Tamam: ${reps.length} sayfa · sadakat ${f ? `${f.verdict} (%${f.pctOff} fark)` : '—'} ${mode === 'replace' ? ' · "Referans" katmanını açıp karşılaştırabilirsiniz' : ''}`, 'info', 9000);
     state.selection = [];
-    fit();
+    if (mode === 'replace') { state.frameId = null; state.fitted = false; fit(); }
   } finally { btn.disabled = false; }
 });
 
@@ -868,7 +889,7 @@ function renderLayers() {
     row.className = `item${n.type === 'group' && n.isLayer ? ' layer' : ''}${state.selection.includes(n.id) ? ' selected' : ''}${n.visible ? '' : ' hidden'}`;
     row.style.paddingLeft = `${4 + depth * 12}px`;
     const icon = document.createElement('span'); icon.className = 'type'; icon.textContent = n.type === 'group' && n.isLayer ? '☰' : TYPE_ICON[n.type];
-    const name = document.createElement('span'); name.className = 'name'; name.textContent = n.name ?? (n.type === 'text' ? `“${n.content}”` : n.id);
+    const name = document.createElement('span'); name.className = 'name'; name.textContent = n.name ?? autoName(n);
     name.title = n.id;
     const eye = document.createElement('button'); eye.textContent = '👁'; eye.title = 'Görünürlük'; if (!n.visible) eye.classList.add('off');
     eye.onclick = (ev) => { ev.stopPropagation(); void run(api.op('layer_toggle', { id: n.id })); };
@@ -994,7 +1015,7 @@ function renderProps() {
 
 $('add-layer').onclick = async () => {
   const count = frame()?.nodes.filter((n) => n.type === 'group' && n.isLayer).length ?? 0;
-  await run(api.op('layer_create', { name: `Katman ${count + 1}` }));
+  await run(api.op('layer_create', { name: `Katman ${count + 1}`, frameId: frame()?.id }));
 };
 
 // ———————————————————————————————— etkinlik akışı ve bağlantı
@@ -1017,8 +1038,41 @@ function setLock(l: LockInfo) {
   if (l.held) b.textContent = `🔒 ${l.agentId}`;
 }
 
+const TYPE_TR: Record<string, string> = { path: 'Yol', rect: 'Dikdörtgen', ellipse: 'Elips', line: 'Çizgi', text: 'Metin', group: 'Grup', image: 'Görsel' };
+/** Adsız node için okunur etiket: "Yol #d91933", "Grup (12)"; ham id yalnız ipucunda. */
+function autoName(n: VNode): string {
+  if (n.type === 'text') return `“${n.content}”`;
+  if (n.type === 'group') return `${n.clip ? 'Kırpma' : 'Grup'} (${n.children.length})`;
+  const fill = n.style?.fill;
+  const color = typeof fill === 'string' && fill !== 'none' ? fill : typeof n.style?.stroke === 'string' && n.style.stroke !== 'none' ? n.style.stroke : typeof fill === 'object' && fill ? 'gradyan' : '';
+  return `${TYPE_TR[n.type] ?? n.type}${color ? ` ${color}` : ''}`;
+}
+
+function refreshFrameSelect() {
+  const sel = $<HTMLSelectElement>('frame-select');
+  const list = frames();
+  sel.hidden = list.length < 2;
+  const cur = frame();
+  const sig = list.map((f) => `${f.id}:${f.name}`).join('|');
+  if (sel.dataset.sig !== sig) {
+    sel.dataset.sig = sig;
+    sel.replaceChildren(...list.map((f, i) => { const o = document.createElement('option'); o.value = f.id; o.textContent = f.name || `Frame ${i + 1}`; return o; }));
+  }
+  if (cur) sel.value = cur.id;
+}
+
+function showFrame(id: string | null) {
+  state.frameId = id;
+  state.selection = []; state.editPath = null; state.pen = null;
+  fit();
+  refreshPanels();
+  refreshFrameSelect();
+}
+for (const ev of ['change', 'input']) $('frame-select').addEventListener(ev, (e) => { const v = (e.target as HTMLSelectElement).value; if (v !== frame()?.id) showFrame(v); });
+
 function setDoc(doc: VDocument) {
   state.doc = doc;
+  if (state.frameId && !frames().some((f) => f.id === state.frameId)) state.frameId = null;
   if (state.committing) { state.preview = null; state.pointPreview = null; }
   state.selection = state.selection.filter((id) => locate(doc, id));
   if (state.editPath && !locate(doc, state.editPath)) state.editPath = null;
@@ -1026,13 +1080,18 @@ function setDoc(doc: VDocument) {
   $('version').textContent = `v${doc.version}`;
   if (!state.fitted) { state.fitted = true; fit(); }
   refreshPanels();
+  refreshFrameSelect();
 }
 
 api.connect({
   hello: (doc, lock) => { setDoc(doc); setLock(lock); },
   change: (e) => {
-    const prevFrame = state.doc?.pages[0]?.frames[0];
+    const prevFrame = frame();
+    const prevIds = new Set(frames().map((f) => f.id));
     setDoc(e.document);
+    // Ajan yeni frame açtıysa (frame_create, pdf_import append) ona geç: çizim canlı görünsün
+    const added = frames().filter((f) => !prevIds.has(f.id));
+    if (prevIds.size && added.length && added.length < frames().length) { showFrame(added[added.length - 1].id); addActivity(e.agentId, e.label); return; }
     const f = frame();
     if (prevFrame && f && (prevFrame.w !== f.w || prevFrame.h !== f.h || prevFrame.id !== f.id)) fit();
     addActivity(e.agentId, e.label);

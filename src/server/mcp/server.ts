@@ -66,7 +66,8 @@ export function createMcpServer(backend: Backend, opts: McpOptions): McpServer {
   // ——— Düzenleme operasyonları (şemalar model katmanından)
   for (const name of Object.keys(OP_SCHEMAS) as OpName[]) {
     const schema = OP_SCHEMAS[name];
-    reg(name, OP_DESCRIPTIONS[name], { ...schema.shape, ...expected }, async (a) => {
+    const idAlias: Record<string, z.ZodType> = 'ids' in schema.shape && !('id' in schema.shape) ? { ids: (schema.shape as any).ids.optional(), id: z.string().optional().describe('Tek node için ids yerine kısayol (ids ya da id gerekli)') } : {};
+    reg(name, OP_DESCRIPTIONS[name], { ...schema.shape, ...idAlias, ...expected }, async (a) => {
       const { expectedVersion, ...args } = a;
       const r = await call('op', { op: name, args, expectedVersion });
       return { content: [text({ version: r.version, result: r.result })] };
@@ -121,7 +122,7 @@ export function createMcpServer(backend: Backend, opts: McpOptions): McpServer {
     method: z.enum(['overlap', 'stacked', 'abutting']).optional().describe('overlap (önerilen): bağımsız şekiller, boşluksuz'),
     refine: z.boolean().optional().describe('Kalite hedefi tutmazsa ayarları kendisi sıkılaştırır (varsayılan true)'),
   };
-  reg('vectorize_image', 'Raster görseli (PNG/JPEG/WebP/GIF/BMP/TIFF) profesyonel vektöre çevir: OKLab renk nicemleme, renk başına bağımsız şekil, pürüzsüz Bézier, sivri köşe onarımı. Sonuç kaynakla piksel piksel doğrulanır (report.fidelity: pctOff < %0.25 mükemmel, < %1 çok iyi). mode=replace yeni belge (gizli+kilitli "Referans" katmanı + "Vektör" katmanı); mode=merge mevcut belgeye grup olarak yerleştirir (placement ile konum/boyut). Ardından compare_reference ile fark haritasını görün.', {
+  reg('vectorize_image', 'Raster görseli (PNG/JPEG/WebP/GIF/BMP/TIFF) profesyonel vektöre çevir: OKLab renk nicemleme, renk başına bağımsız şekil, pürüzsüz Bézier, sivri köşe onarımı. Sonuç kaynakla piksel piksel doğrulanır (report.fidelity: pctOff < %0.25 mükemmel, < %1 çok iyi). mode=replace TÜM belgeyi yeni belgeyle değiştirir (önceki frame ve id\'ler kaybolur; gizli+kilitli "Referans" katmanı + "Vektör" katmanı); mode=merge mevcut belgeye grup olarak yerleştirir (parentId ile hedef, placement ile konum/boyut). Mod verilmez ve parentId/placement varsa merge varsayılır. Ardından compare_reference ile fark haritasını görün.', {
     path: z.string().optional().describe('Görsel dosyası (sunucu çalışma dizinine göreli)'),
     data: z.string().optional().describe('veya base64 / data URI'),
     mode: z.enum(['replace', 'merge']).optional(),
@@ -134,7 +135,7 @@ export function createMcpServer(backend: Backend, opts: McpOptions): McpServer {
     const r = await call('vectorize_image', a);
     return { content: [text(r)] };
   });
-  reg('pdf_import', 'PDF\'i vektör olarak içe aktar. Vektör sayfalar kayıpsız gelir (yollar, gradyanlar, kırpmalar, gömülü görseller; metin = glif eğrileri) ve yapı sadeleştirilir (glifler satır başına tek path, gereksiz kırpmalar temizlenir). Taranmış (yalnız görsel içeren) sayfalar otomatik tespit edilip 300 dpi üzerinden izlenir. Her sayfa ayrı frame; her biri poppler render\'ıyla doğrulanır (fidelity). mode=replace yeni belge, append mevcut belgeye frame ekler.', {
+  reg('pdf_import', 'PDF\'i vektör olarak içe aktar. Vektör sayfalar kayıpsız gelir (yollar, gradyanlar, kırpmalar, gömülü görseller; metin = glif eğrileri) ve yapı sadeleştirilir (glifler satır başına tek path, gereksiz kırpmalar temizlenir). Taranmış (yalnız görsel içeren) sayfalar otomatik tespit edilip 300 dpi üzerinden izlenir. Her sayfa ayrı frame; her biri poppler render\'ıyla doğrulanır (fidelity). mode=replace TÜM belgeyi değiştirir (önceki frame\'ler kaybolur), append mevcut belgeye frame ekler.', {
     path: z.string().optional().describe('PDF dosyası (sunucu çalışma dizinine göreli)'),
     data: z.string().optional().describe('veya PDF içeriği base64'),
     name: z.string().optional().describe('Belge adı'),

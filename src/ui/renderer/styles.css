@@ -35,6 +35,7 @@ button.danger:hover { border-color: var(--danger); color: var(--danger); }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 650; letter-spacing: 0.2px; }
 .logo { width: 18px; height: 18px; border-radius: 5px; background: conic-gradient(from 200deg, #4f8cff, #a45cff, #ff5c9a, #4f8cff); }
 .doc-title { color: var(--muted); max-width: 30ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.frame-select { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; max-width: 24ch; font: inherit; }
 .spacer { flex: 1; }
 .group { display: flex; gap: 4px; align-items: center; }
 .zoom span { min-width: 48px; text-align: center; color: var(--muted); font-variant-numeric: tabular-nums; }

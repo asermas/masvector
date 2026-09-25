@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { createCanvas } from '@napi-rs/canvas';
@@ -11,12 +12,13 @@ import { combineMaskImages } from '../src/render/image-ops.js';
 import { decodeImageBuffer } from '../src/render/png.js';
 import { compareDocument } from '../src/vectorize/compare.js';
 import { pdfToDoc, vectorizeImageToDoc } from '../src/vectorize/index.js';
+import { popplerAvailable, popplerBin, popplerEnv } from '../src/vectorize/pdf.js';
 import { traceImage } from '../src/vectorize/trace.js';
 import { walk } from '../src/model/scene.js';
 import type { PathNode, VDocument } from '../src/common/types.js';
 
 const FX = path.resolve('tests/fixtures');
-const hasPoppler = (() => { try { execFileSync('pdftocairo', ['-v'], { stdio: 'ignore' }); return true; } catch { return false; } })();
+const hasPoppler = popplerAvailable();
 const leaves = (doc: VDocument) => [...walk(doc.pages[0].frames[0].nodes)].map((w) => w.node);
 const vectorPaths = (doc: VDocument) => leaves(doc).filter((n): n is PathNode => n.type === 'path');
 
@@ -79,9 +81,10 @@ describe('SVG içe aktarma: kırpma, maske, görsel', () => {
   });
   it('temizlik görüntüyü değiştirmez', () => {
     if (!hasPoppler) return;
-    const tmp = execFileSync('mktemp', ['-d']).toString().trim();
-    execFileSync('pdftocairo', ['-svg', path.join(FX, 'vector.pdf'), `${tmp}/v.svg`]);
-    execFileSync('pdftoppm', ['-r', '72', '-png', '-singlefile', path.join(FX, 'vector.pdf'), `${tmp}/v`]);
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'mv-'));
+    const o = { env: popplerEnv(), windowsHide: true };
+    execFileSync(popplerBin('pdftocairo'), ['-svg', path.join(FX, 'vector.pdf'), `${tmp}/v.svg`], o);
+    execFileSync(popplerBin('pdftoppm'), ['-r', '72', '-png', '-singlefile', path.join(FX, 'vector.pdf'), `${tmp}/v`], o);
     const r = importSVG(readFileSync(`${tmp}/v.svg`, 'utf8'), { combineMask: combineMaskImages });
     const ref = decodeImageBuffer(readFileSync(`${tmp}/v.png`))!;
     const before = compareDocument(r.doc, ref).metrics.pctOff;

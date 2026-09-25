@@ -3,6 +3,6 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('masvector', {
   isElectron: true,
-  saveExport: (format, url) => ipcRenderer.invoke('save-export', format, url),
+  saveExport: (format, url, name) => ipcRenderer.invoke('save-export', format, url, name),
   serverInfo: () => ipcRenderer.invoke('server-info'),
 });

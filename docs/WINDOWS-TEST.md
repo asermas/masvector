@@ -57,7 +57,7 @@ $EXE = Join-Path $APP "MasVector.exe"
 Test-Path $EXE
 Test-Path (Join-Path $APP "resources\poppler-win\bin\pdftocairo.exe")
 Test-Path (Join-Path $APP "resources\app\dist\bin\mcp-stdio.js")
-Test-Path (Join-Path $env:USERPROFILE "Desktop\MasVector.lnk")
+Test-Path (Join-Path ([Environment]::GetFolderPath("Desktop")) "MasVector.lnk")   # OneDrive Masaüstü de olabilir
 ```
 
 **Beklenen:** Dört satır da `True`. SmartScreen uyarısı çıktıysa rapora yaz ("Ek bilgi → Yine de
@@ -100,7 +100,7 @@ $env:ELECTRON_RUN_AS_NODE = "1"
 $VEC = Join-Path $APP "resources\app\dist\bin\vectorize.js"
 foreach ($n in "vector.pdf","scanned.pdf","logo.png","logo-q55.jpg","illustration.png") {
   "=== $n"
-  & $EXE $VEC (Join-Path $F $n) --formats svg,pdf,png 2>&1 | Select-String '"verdict"|"pctOff"|"kind"|written|Error|Hata'
+  & $EXE $VEC (Join-Path $F $n) --out (Join-Path $F "cikti\$n") --formats svg,pdf,png 2>&1 | Select-String '"verdict"|"pctOff"|"kind"|written|Error|Hata'
 }
 Remove-Item Env:ELECTRON_RUN_AS_NODE
 Get-ChildItem $F | Select-Object Name, Length
@@ -116,7 +116,7 @@ Get-ChildItem $F | Select-Object Name, Length
 | logo-q55.jpg | image | < 0.5 |
 | illustration.png | image | < 0.3 |
 
-Her girdi için `.svg`, `.pdf`, `.png` çıktıları oluşmalı. `pdftocairo bulunamadı` ya da DLL hatası
+Her girdi için `cikti\` altında `.svg`, `.pdf`, `.png` çıktıları oluşmalı; kaynak dosyalar değişmemeli (1.1'den itibaren CLI girdinin üzerine asla yazmaz: `--out` verilmezse çakışan çıktı `-vektor` son eki alır). `pdftocairo bulunamadı` ya da DLL hatası
 çıkarsa bu **kritik** hatadır, tam çıktıyı rapora ekle.
 
 ---

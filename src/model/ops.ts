@@ -723,7 +723,13 @@ function snapPoints(l: Located, snap: (v: number) => number) {
 export function applyOp(doc: VDocument, op: string, rawArgs: unknown): unknown {
   const schema = (OP_SCHEMAS as Record<string, (typeof OP_SCHEMAS)[OpName]>)[op];
   if (!schema) throw new VectorError('INVALID_ARGUMENT', `Bilinmeyen operasyon: ${op}`);
-  const parsed = schema.safeParse(rawArgs ?? {});
+  // Kolaylık: ids bekleyen operasyonlara tekil id de kabul edilir (node_add_* tekil id döndürür)
+  let args = rawArgs ?? {};
+  if ('ids' in schema.shape && !('id' in schema.shape) && typeof (args as any).id === 'string' && (args as any).ids === undefined) {
+    const { id, ...rest } = args as Record<string, unknown>;
+    args = { ...rest, ids: [id] };
+  }
+  const parsed = schema.safeParse(args);
   if (!parsed.success) {
     throw new VectorError('INVALID_ARGUMENT', `${op} argümanları geçersiz: ${parsed.error.issues.map((i) => `${i.path.join('.') || '(kök)'}: ${i.message}`).join('; ')}`);
   }
