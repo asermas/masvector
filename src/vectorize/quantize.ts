@@ -23,7 +23,15 @@ const d2 = (p: Lab, q: Lab) => (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] -
 export interface Raster { w: number; h: number; rgba: Uint8ClampedArray }
 
 /** Her pikselin OKLab değeri + düzlük ağırlığı (3×3 komşulukta renk sapması küçükse düz). */
+const analyzeCache = new WeakMap<Uint8ClampedArray, { alphaCut: number; r: { lab: Float32Array; flat: Uint8Array } }>();
 function analyze(img: Raster, alphaCut: number) {
+  const c = analyzeCache.get(img.rgba);
+  if (c && c.alphaCut === alphaCut) return c.r;
+  const r = analyzeRaw(img, alphaCut);
+  analyzeCache.set(img.rgba, { alphaCut, r });
+  return r;
+}
+function analyzeRaw(img: Raster, alphaCut: number) {
   const { w, h, rgba } = img;
   const lab = new Float32Array(w * h * 3);
   for (let p = 0; p < w * h; p++) {
@@ -82,7 +90,7 @@ function kmeans(pts: Lab[], wts: number[], k: number, iters = 24): { centers: La
   return { centers, error: Math.sqrt(error / wsum), counts };
 }
 
-export interface Palette { colors: Lab[]; rgb: [number, number, number][]; k: number; error: number; tried: { k: number; error: number }[] }
+export interface Palette { colors: Lab[]; rgb: [number, number, number][]; k: number; error: number; tried: { k: number; error: number }[]; /** İnce yapı (çizgi/küçük metin) rengi: düz pikseli yok. */ thin?: boolean[] }
 
 /**
  * Palet çıkar. `k` verilirse tam o sayıda; yoksa 2..maxK arasında dirsek (elbow) + hedef hata ile seç.
@@ -131,7 +139,126 @@ export function extractPalette(img: Raster, o: { k?: number; maxK?: number; targ
   const merged: Lab[] = [];
   for (const c of centers) if (!merged.some((m) => d2(m, c) < 0.0004)) merged.push(c);
   centers = merged;
-  return { colors: centers, rgb: centers.map(oklabToRgb), k: centers.length, error: best.error, tried };
+  const base = centers.length;
+  if (hasFlat && !o.k) centers.push(...thinColors(img, lab, flat, centers, alphaCut, (o.maxK ?? 16) - centers.length));
+  return { colors: centers, rgb: centers.map(oklabToRgb), k: centers.length, error: best.error, tried, thin: centers.map((_, i) => i >= base) };
+}
+
+/** OKLab'da p'nin [a,b] doğru parçasına uzaklığının karesi (iki rengin kenar yumuşatma karışımı mı?). */
+function segD2(p: Lab, a: Lab, b: Lab): number {
+  const v0 = b[0] - a[0], v1 = b[1] - a[1], v2 = b[2] - a[2];
+  const L = v0 * v0 + v1 * v1 + v2 * v2;
+  const t = L > 1e-12 ? Math.min(1, Math.max(0, ((p[0] - a[0]) * v0 + (p[1] - a[1]) * v1 + (p[2] - a[2]) * v2) / L)) : 0;
+  return (p[0] - a[0] - t * v0) ** 2 + (p[1] - a[1] - t * v1) ** 2 + (p[2] - a[2] - t * v2) ** 2;
+}
+
+/** Piksel, paletteki en yakın 4 rengin tekiyle ya da ikisinin karışımıyla açıklanabiliyor mu? Açıklanamayan uzaklığın karesi. */
+function unexplained(p: Lab, colors: Lab[]): number {
+  const near = colors.map((c, i) => [d2(p, c), i] as const).sort((a, b) => a[0] - b[0]).slice(0, 4);
+  let best = near[0]?.[0] ?? Infinity;
+  for (let a = 0; a < near.length; a++) for (let b = a + 1; b < near.length; b++) best = Math.min(best, segD2(p, colors[near[a][1]], colors[near[b][1]]));
+  return best;
+}
+
+/**
+ * İnce çizginin en yoğun pikselleri bile tam kaplanmaz (köşegen/eğri 1 px çizgide ~%75–85): gözlenen uç renk,
+ * zeminden (en yakın palet rengi) gerçek renge giden yolun ~%85'i sayılır ve sRGB'de o orana göre uzatılır (gamut içinde).
+ */
+function extrapolate(c: Lab, centers: Lab[]): Lab {
+  let bg = centers[0], bd = Infinity;
+  for (const q of centers) { const dd = d2(c, q); if (dd < bd) { bd = dd; bg = q; } }
+  const B = oklabToRgb(bg), C = oklabToRgb(c);
+  let f = 1 / 0.85;
+  for (let i = 0; i < 3; i++) { const dlt = C[i] - B[i]; if (dlt < 0) f = Math.min(f, B[i] / -dlt); else if (dlt > 0) f = Math.min(f, (255 - B[i]) / dlt); }
+  const E = [0, 1, 2].map((i) => Math.round(B[i] + (C[i] - B[i]) * Math.max(1, f))) as [number, number, number];
+  return rgbToOklab(E[0], E[1], E[2]);
+}
+
+/**
+ * İnce yapı renkleri: 1–2 px çizgiler, küçük metin, noktalar hiç "düz" piksel içermez; palet yalnız düz bölgelerden
+ * öğrenildiğinde bu renkler kaybolur (çizgiler silinir). Palet renklerinin tekiyle ya da karışımıyla açıklanamayan
+ * pikseller kümelenir ve her küme, kenar yumuşatmasıyla açılmış tonun ötesine — en doygun/uç üyelerine — itilir.
+ */
+function thinColors(img: Raster, lab: Float32Array, flat: Uint8Array, centers: Lab[], alphaCut: number, room: number): Lab[] {
+  if (room <= 0 || !centers.length) return [];
+  const n = img.w * img.h, step = Math.max(1, Math.floor(n / 150_000));
+  const pts: Lab[] = [], far: number[] = [];
+  const W = img.w, H = img.h;
+  const nearestC = (q: number) => { let bd = Infinity, bi = 0; for (let i = 0; i < centers.length; i++) { const c = centers[i]; const dd = (lab[q * 3] - c[0]) ** 2 + (lab[q * 3 + 1] - c[1]) ** 2 + (lab[q * 3 + 2] - c[2]) ** 2; if (dd < bd) { bd = dd; bi = i; } } return bi; };
+  // Çizgi mi, kenar artığı mı: bir eksen boyunca iki yandaki ilk düz pikseller AYNI renkteyse çizgi (zemin üstünde
+  // ince yapı); farklıysa iki bölgenin sınırındaki JPEG çınlaması / yumuşatma kalıntısıdır → palet rengi değildir.
+  const lineLike = (p: number) => {
+    const x = p % W, y = (p / W) | 0;
+    for (const [dx, dy] of [[1, 0], [0, 1], [1, 1], [1, -1]]) {
+      let a = -1, b = -1;
+      for (let d = 1; d <= 10 && a < 0; d++) { const xx = x + dx * d, yy = y + dy * d; if (xx < 0 || yy < 0 || xx >= W || yy >= H) break; const q = yy * W + xx; if (flat[q] === 2) a = nearestC(q); }
+      for (let d = 1; d <= 10 && b < 0; d++) { const xx = x - dx * d, yy = y - dy * d; if (xx < 0 || yy < 0 || xx >= W || yy >= H) break; const q = yy * W + xx; if (flat[q] === 2) b = nearestC(q); }
+      if (a >= 0 && a === b) return true;
+    }
+    return false;
+  };
+  let opaque = 0;
+  for (let p = 0; p < n; p += step) {
+    if (img.rgba[p * 4 + 3] < alphaCut) continue;
+    opaque++;
+    if (flat[p] === 2) continue;
+    const c: Lab = [lab[p * 3], lab[p * 3 + 1], lab[p * 3 + 2]];
+    const u = unexplained(c, centers);
+    if (u > 0.05 ** 2 && lineLike(p)) { pts.push(c); far.push(u); }
+  }
+  // Gürültü değil yapı: açıklanamayan pikseller opak alanın en az ‰1'i
+  if (pts.length < Math.max(12, opaque * 0.001)) return [];
+  const wts = pts.map(() => 1);
+  let prevErr = Infinity;
+  let km = kmeans(pts, wts, 1);
+  for (let k = 2; k <= Math.min(room, 8); k++) {
+    const cur = kmeans(pts, wts, k);
+    if (cur.error > km.error * 0.8 || cur.error < 0.02) { if (cur.error < km.error * 0.8) km = cur; break; }
+    prevErr = km.error; km = cur;
+  }
+  void prevErr;
+  const cands: { col: Lab; u: number }[] = [];
+  for (let c = 0; c < km.centers.length; c++) {
+    // Kenar yumuşatılmış ince çizgi pikselleri zemin→çizgi rengi doğrusu üzerindedir: gerçek renk bu dağılımın UCU.
+    // Küme üyelerinden paletten en uzak %3'ün ortalaması (tek aykırı piksele değil, kalabalık uca bakar).
+    const mem: { p: Lab; u: number }[] = [];
+    for (let i = 0; i < pts.length; i++) {
+      let bd = Infinity, bi = 0;
+      for (let q = 0; q < km.centers.length; q++) { const dd = d2(pts[i], km.centers[q]); if (dd < bd) { bd = dd; bi = q; } }
+      if (bi === c) mem.push({ p: pts[i], u: far[i] });
+    }
+    if (mem.length < Math.max(6, opaque * 0.0003)) continue;
+    mem.sort((a, b) => b.u - a.u);
+    const top = mem.slice(0, Math.max(3, Math.ceil(mem.length * 0.03)));
+    const col: Lab = [0, 0, 0];
+    for (const m of top) { col[0] += m.p[0] / top.length; col[1] += m.p[1] / top.length; col[2] += m.p[2] / top.length; }
+    cands.push({ col: extrapolate(col, centers), u: unexplained(col, centers) });
+  }
+  // En uç renkler önce: ardından gelen ara tonlar (ör. kırmızı çizginin pembe yumuşatması) yeni renkle açıklanıyorsa eklenmez
+  const out: Lab[] = [];
+  for (const c of cands.sort((a, b) => b.u - a.u)) if (unexplained(c.col, [...centers, ...out]) > 0.05 ** 2) out.push(c.col);
+  return out;
+}
+
+/**
+ * Komşu renklerle açıklanamayan piksel için: zemin (komşu renk a) ile başka bir palet rengi x arasındaki karışım
+ * doğrusuna en iyi oturan çifti bul; karışım oranı ≥ 0.42 ise x, değilse a. En-yakın-renk seçimi burada yanılır
+ * (beyaz üstündeki ince siyah çizginin grisi, kırmızıya siyahtan daha "yakın" olabilir).
+ */
+function mixLabel(c: Lab, cand: Set<number>, colors: Lab[], thinIdx: number[]): { a: number; x: number; t: number; d2: number } {
+  let best = Infinity, r = { a: [...cand][0], x: -1, t: 0, d2: Infinity };
+  for (const a of cand) for (const x of thinIdx) {
+    if (cand.has(x)) continue;
+    const A = colors[a], X = colors[x];
+    const v0 = X[0] - A[0], v1 = X[1] - A[1], v2 = X[2] - A[2];
+    const L = v0 * v0 + v1 * v1 + v2 * v2;
+    if (L < 1e-12) continue;
+    const t = ((c[0] - A[0]) * v0 + (c[1] - A[1]) * v1 + (c[2] - A[2]) * v2) / L;
+    const tc = Math.min(1, Math.max(0, t));
+    const dd = (c[0] - A[0] - tc * v0) ** 2 + (c[1] - A[1] - tc * v1) ** 2 + (c[2] - A[2] - tc * v2) ** 2;
+    if (dd < best) { best = dd; r = { a, x, t, d2: dd }; }
+  }
+  return r;
 }
 
 /**
@@ -162,6 +289,24 @@ export function labelize(img: Raster, pal: Palette, alphaCut = 128): Int16Array 
     else if (flat[p]) out[p] = nearest(p);
     else pending.push(p);
   }
+  // İnce yapı pikselleri (komşu renklerle açıklanamayan): karışım oranı t ile birlikte ertelenir; eşik yerel tepeye
+  // göre uyarlanır (köşegen 1 px çizgide t hiç 0.5'e ulaşmaz → sabit eşik çizgiyi kesik kesik yapar)
+  const thin = new Map<number, { a: number; x: number; t: number }>();
+  const allIdx = pal.colors.map((_, i) => i);
+  // Çizgi benzeri piksel: bir eksende iki yandaki ilk düz pikseller aynı renkte (zemin üstünde ince yapı).
+  // İki bölgenin sınırındaki karışım pikselleri (farklı renkler) buraya girmez → kenarlarda kırıntı oluşmaz.
+  const lineLike = (p: number) => {
+    const x = p % w, y = (p / w) | 0;
+    let hits = 0;
+    for (const [dx, dy] of [[1, 0], [0, 1], [1, 1], [1, -1]]) {
+      let a = -1, b = -1;
+      for (let d = 1; d <= 10 && a < 0; d++) { const xx = x + dx * d, yy = y + dy * d; if (xx < 0 || yy < 0 || xx >= w || yy >= h) break; const q = yy * w + xx; if (flat[q] === 2) a = out[q]; }
+      for (let d = 1; d <= 10 && b < 0; d++) { const xx = x - dx * d, yy = y - dy * d; if (xx < 0 || yy < 0 || xx >= w || yy >= h) break; const q = yy * w + xx; if (flat[q] === 2) b = out[q]; }
+      // Gerçek ince çizgi en az iki eksende (dik + köşegen) aynı zemini görür; kenar saçağı en çok birinde
+      if (a >= 0 && a === b && ++hits >= 2) return true;
+    }
+    return false;
+  };
   // Düz bölgelerden içeri doğru yay (her tur bir piksel)
   for (let pass = 0; pass < 6 && pending.length; pass++) {
     const assign: [number, number][] = [];
@@ -175,10 +320,53 @@ export function labelize(img: Raster, pal: Palette, alphaCut = 128): Int16Array 
         const v = out[yy * w + xx];
         if (v >= 0) cand.add(v);
       }
-      if (cand.size) assign.push([p, nearest(p, cand)]); else still.push(p);
+      if (!cand.size) { still.push(p); continue; }
+      // Komşu renklerin tekiyle/karışımıyla açıklanamayan piksel (ince çizgi, küçük metin): tüm palete açılır
+      if (K > 1) {
+        const c: Lab = [lab[p * 3], lab[p * 3 + 1], lab[p * 3 + 2]];
+        if (unexplained(c, [...cand].map((i) => pal.colors[i])) > 0.05 ** 2 && lineLike(p)) {
+          const m = mixLabel(c, cand, pal.colors, allIdx);
+          // Yalnız zemin + tek renk karışımıyla gerçekten açıklanıyorsa (ΔE < 0.04) ince yapı sayılır
+          if (m.x >= 0 && m.d2 < 0.04 ** 2) { thin.set(p, m); assign.push([p, m.a]); continue; }
+        }
+      }
+      assign.push([p, nearest(p, cand)]);
     }
     for (const [p, v] of assign) out[p] = v;
     pending = still;
+  }
+  if (thin.size) {
+    const tx = new Float32Array(n).fill(-1);
+    for (const [p, m] of thin) if (m.x >= 0) tx[p] = m.t;
+    for (const [p, m] of thin) {
+      if (m.x < 0) continue;
+      const x = p % w, y = (p / w) | 0;
+      let peak = m.t;
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+        const xx = x + dx, yy = y + dy;
+        if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+        const q = yy * w + xx, m2 = thin.get(q);
+        if (m2 && m2.x === m.x && tx[q] > peak) peak = tx[q];
+      }
+      if (m.t >= Math.max(0.2, Math.min(0.5, 0.55 * Math.min(1, peak)))) out[p] = m.x;
+    }
+    // İnce yapı uzun olur: karışım yoluyla atanmış 8-bağlı bileşen 12 pikselden kısaysa (kenar saçağı, tek leke) geri al
+    const seen = new Uint8Array(n), stack: number[] = [], comp: number[] = [];
+    for (const [p0, m0] of thin) {
+      if (seen[p0] || out[p0] !== m0.x) continue;
+      stack.length = 0; comp.length = 0; stack.push(p0); seen[p0] = 1;
+      while (stack.length) {
+        const p = stack.pop()!; comp.push(p);
+        const x = p % w, y = (p / w) | 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx, yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+          const q = yy * w + xx, mq = thin.get(q);
+          if (!seen[q] && mq && out[q] === m0.x) { seen[q] = 1; stack.push(q); }
+        }
+      }
+      if (comp.length < 12) for (const p of comp) out[p] = thin.get(p)!.a;
+    }
   }
   for (const p of pending) out[p] = nearest(p); // düz komşusu olmayanlar (foto/gradyan)
   return out;
@@ -189,14 +377,21 @@ export function modeFilter(lab: Int16Array, w: number, h: number, passes = 1): I
   let src = lab;
   for (let pass = 0; pass < passes; pass++) {
     const out = new Int16Array(src);
-    const cnt = new Map<number, number>();
+    // Etiketler küçük tamsayı (-1 = saydam): sayım dizisi + 9 elemanlı değer listesi (Map yok → ~10× hızlı)
+    let maxL = 0;
+    for (let i = 0; i < src.length; i++) if (src[i] > maxL) maxL = src[i];
+    const cnt = new Int32Array(maxL + 2);
+    const vals = new Int32Array(9);
     for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
-      const p = y * w + x;
-      cnt.clear();
-      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const v = src[p + dy * w + dx]; cnt.set(v, (cnt.get(v) ?? 0) + 1); }
-      let bv = src[p], bc = 0;
-      for (const [v, c] of cnt) if (c > bc) { bc = c; bv = v; }
-      if (bv !== src[p] && bc >= 6 && (cnt.get(src[p]) ?? 0) <= 2) out[p] = bv;
+      const p = y * w + x, own = src[p];
+      // Hızlı yol: 4 komşu kendisiyle aynıysa değişemez (≥6 karşı oy gerekir)
+      if (src[p - 1] === own && src[p + 1] === own && src[p - w] === own && src[p + w] === own) continue;
+      let nv = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const v = src[p + dy * w + dx] + 1; if (cnt[v]++ === 0) vals[nv++] = v; }
+      let bv = own + 1, bc = 0;
+      for (let i = 0; i < nv; i++) if (cnt[vals[i]] > bc) { bc = cnt[vals[i]]; bv = vals[i]; }
+      if (bv !== own + 1 && bc >= 6 && cnt[own + 1] <= 2) out[p] = bv - 1;
+      for (let i = 0; i < nv; i++) cnt[vals[i]] = 0;
     }
     src = out;
   }
@@ -206,33 +401,42 @@ export function modeFilter(lab: Int16Array, w: number, h: number, passes = 1): I
 /** `minArea`dan küçük bağlı bileşenleri (4-komşuluk) en çok sınır paylaştıkları etikete kat (lekeleri sil). */
 export function removeSpeckles(lab: Int16Array, w: number, h: number, minArea: number): number {
   if (minArea <= 1) return 0;
-  const seen = new Uint8Array(w * h);
-  const stack = new Int32Array(w * h);
+  const n = w * h;
+  const seen = new Uint8Array(n);
+  const stack = new Int32Array(n);
   const comp = new Int32Array(Math.max(1, minArea));
+  let maxL = 0;
+  for (let i = 0; i < n; i++) if (lab[i] > maxL) maxL = lab[i];
+  // Sınır sayımı: etiket+1 dizini (−1 saydam = 0); dokunulanlar listesiyle sıfırlanır (kapanış / Map yok)
+  const bcnt = new Int32Array(maxL + 2);
+  const touched: number[] = [];
   let removed = 0;
-  for (let s = 0; s < w * h; s++) {
+  for (let s = 0; s < n; s++) {
     if (seen[s]) continue;
     const v = lab[s];
     let sp = 0, size = 0;
     stack[sp++] = s; seen[s] = 1;
-    const border = new Map<number, number>();
+    touched.length = 0;
     while (sp) {
       const p = stack[--sp];
       if (size < minArea) comp[size] = p;
       size++;
       const x = p % w;
-      if (x > 0) visit(p - 1); if (x < w - 1) visit(p + 1); if (p >= w) visit(p - w); if (p < w * (h - 1)) visit(p + w);
+      for (let k = 0; k < 4; k++) {
+        const q = k === 0 ? (x > 0 ? p - 1 : -1) : k === 1 ? (x < w - 1 ? p + 1 : -1) : k === 2 ? p - w : p + w;
+        if (q < 0 || q >= n) continue;
+        const lq = lab[q];
+        if (lq === v) { if (!seen[q]) { seen[q] = 1; stack[sp++] = q; } }
+        else if (size < minArea) { if (bcnt[lq + 1]++ === 0) touched.push(lq + 1); }
+      }
     }
-    if (size < minArea && border.size) {
+    if (size < minArea && touched.length) {
       let bv = v, bc = -1;
-      for (const [k, c] of border) if (c > bc) { bc = c; bv = k; }
+      for (const t of touched) if (bcnt[t] > bc) { bc = bcnt[t]; bv = t - 1; }
       for (let i = 0; i < size; i++) lab[comp[i]] = bv;
       removed++;
     }
-    function visit(q: number) {
-      if (lab[q] === v) { if (!seen[q]) { seen[q] = 1; stack[sp++] = q; } }
-      else if (size < minArea) border.set(lab[q], (border.get(lab[q]) ?? 0) + 1);
-    }
+    for (const t of touched) bcnt[t] = 0;
   }
   return removed;
 }

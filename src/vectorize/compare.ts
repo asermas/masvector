@@ -133,6 +133,36 @@ export function median3(rgba: Uint8ClampedArray, w: number, h: number): Uint8Cla
   return out;
 }
 
+/**
+ * Gürültülü kaynak için ölçüt referansı: 3×3 medyan + (gürültü yüksekse) kenar koruyan sigma süzgeci. Süzgeç yalnız
+ * rengi merkezden `3.5 × gürültü`den az farklı komşuların ortalamasını alır: gerçek renk sınırları korunur, tanecik silinir.
+ * `noise`: ortalama mutlak sapma (0–255, estimateNoise).
+ */
+export function cleanReference(rgba: Uint8ClampedArray, w: number, h: number, noise: number): Uint8ClampedArray {
+  let a = median3(rgba, w, h);
+  if (noise < 3) return a;
+  const T = 3.5 * noise, R = noise > 8 ? 3 : 2;
+  for (let pass = 0; pass < 2; pass++) {
+    const out = new Uint8ClampedArray(a);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const p = (y * w + x) * 4;
+      let r = 0, g = 0, b = 0, al = 0, n = 0;
+      for (let dy = -R; dy <= R; dy++) {
+        const yy = y + dy; if (yy < 0 || yy >= h) continue;
+        for (let dx = -R; dx <= R; dx++) {
+          const xx = x + dx; if (xx < 0 || xx >= w) continue;
+          const q = (yy * w + xx) * 4;
+          if (Math.abs(a[q] - a[p]) > T || Math.abs(a[q + 1] - a[p + 1]) > T || Math.abs(a[q + 2] - a[p + 2]) > T || Math.abs(a[q + 3] - a[p + 3]) > T) continue;
+          r += a[q]; g += a[q + 1]; b += a[q + 2]; al += a[q + 3]; n++;
+        }
+      }
+      out[p] = r / n; out[p + 1] = g / n; out[p + 2] = b / n; out[p + 3] = al / n;
+    }
+    a = out;
+  }
+  return a;
+}
+
 /** Fark haritası: kaynak soluk gri, hatalı pikseller kırmızı. */
 export function diffHeatmapPNG(ref: Uint8ClampedArray, mask: Uint8Array, w: number, h: number): Buffer {
   const c = createCanvas(w, h);

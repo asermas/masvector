@@ -15,6 +15,7 @@
     "dev": "node scripts/build-ui.mjs && electron .",
     "demo": "tsx scripts/demo-agent.ts",
     "vectorize": "tsx src/bin/vectorize.ts",
+    "stress": "python scripts/make-stress.py .lab/stress && tsx scripts/stress.ts .lab/stress",
     "icon": "node scripts/make-icon.mjs",
     "dist:win": "npm run build && bash scripts/fetch-poppler-win.sh && node scripts/win-natives.mjs && node scripts/dist-win.cjs",
     "dist:linux": "npm run build && LANG=C.UTF-8 electron-builder --linux --x64"

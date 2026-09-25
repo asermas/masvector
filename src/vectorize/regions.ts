@@ -78,21 +78,28 @@ function curveToStops(ts: number[], cols: number[][], tol: number, maxStops = 8)
 interface Px { x: Float64Array; y: Float64Array; c: Float64Array[] }
 
 /** Boyayı (x, y) noktasında RGBA olarak değerlendir (segmentasyon pikseli koordinatı). */
+const parseCache = new Map<string, [number, number, number, number]>();
+function parseColor(c: string, op = 1): [number, number, number, number] {
+  const key = op === 1 ? c : `${c}|${op}`;
+  let r = parseCache.get(key);
+  if (r) return r;
+  const m = /^#([0-9a-f]{6})([0-9a-f]{2})?$/i.exec(c);
+  if (!m) r = [0, 0, 0, 255 * op];
+  else { const v = parseInt(m[1], 16); r = [(v >> 16) & 255, (v >> 8) & 255, v & 255, (m[2] ? parseInt(m[2], 16) : 255) * op]; }
+  if (parseCache.size > 50_000) parseCache.clear();
+  parseCache.set(key, r);
+  return r;
+}
 export function evalPaint(p: Paint, x: number, y: number): [number, number, number, number] {
-  const parse = (c: string, op = 1): [number, number, number, number] => {
-    const m = /^#([0-9a-f]{6})([0-9a-f]{2})?$/i.exec(c);
-    if (!m) return [0, 0, 0, 255 * op];
-    const v = parseInt(m[1], 16);
-    return [(v >> 16) & 255, (v >> 8) & 255, v & 255, (m[2] ? parseInt(m[2], 16) : 255) * op];
-  };
-  if (typeof p === 'string') return parse(p);
+  const parse = parseColor;
+  if (typeof p === 'string') return [...parse(p)] as [number, number, number, number];
   let t: number;
   if (p.type === 'linear') {
     const dx = p.x2 - p.x1, dy = p.y2 - p.y1, L2 = dx * dx + dy * dy || 1;
     t = ((x - p.x1) * dx + (y - p.y1) * dy) / L2;
   } else t = Math.hypot(x - p.cx, y - p.cy) / (p.r || 1);
   const st = p.stops;
-  if (t <= st[0].offset) return parse(st[0].color, st[0].opacity ?? 1);
+  if (t <= st[0].offset) return [...parse(st[0].color, st[0].opacity ?? 1)] as [number, number, number, number];
   for (let i = 1; i < st.length; i++) {
     if (t <= st[i].offset) {
       const a = parse(st[i - 1].color, st[i - 1].opacity ?? 1), b = parse(st[i].color, st[i].opacity ?? 1);
@@ -101,20 +108,23 @@ export function evalPaint(p: Paint, x: number, y: number): [number, number, numb
     }
   }
   const l = st[st.length - 1];
-  return parse(l.color, l.opacity ?? 1);
+  return [...parse(l.color, l.opacity ?? 1)] as [number, number, number, number];
 }
 
 /** Bölge piksellerine sabit/doğrusal/radyal model uydur; en düşük kalıntılıyı seç. */
 function fitModel(px: Px, n: number): { paint: Paint; model: Region['model']; rms: number; pred: (i: number, k: number) => number } {
   const C = px.c.length; // 4: R, G, B, A
   const mean = px.c.map((ch) => { let s = 0; for (let i = 0; i < n; i++) s += ch[i]; return s / n; });
-  const rmsOf = (pred: (i: number, k: number) => number) => {
+  // Tahminler piksel×kanal dizisinde bir kez hesaplanır (kapanış çağrısı yok)
+  const rmsOf = (P: Float32Array) => {
     let e = 0;
-    for (let i = 0; i < n; i++) for (let k = 0; k < C; k++) { const d = px.c[k][i] - pred(i, k); e += d * d; }
+    for (let k = 0; k < C; k++) { const ch = px.c[k]; for (let i = 0; i < n; i++) { const d = ch[i] - P[i * C + k]; e += d * d; } }
     return Math.sqrt(e / (n * C));
   };
+  let se = 0;
+  for (let k = 0; k < C; k++) { const ch = px.c[k], m = mean[k]; for (let i = 0; i < n; i++) se += (ch[i] - m) ** 2; }
   const solidPred = (_: number, k: number) => mean[k];
-  const solid = { paint: hex(mean[0], mean[1], mean[2], mean[3]) as Paint, model: 'solid' as const, rms: rmsOf(solidPred), pred: solidPred };
+  const solid = { paint: hex(mean[0], mean[1], mean[2], mean[3]) as Paint, model: 'solid' as const, rms: Math.sqrt(se / (n * C)), pred: solidPred };
   if (n < 60 || solid.rms < 2.5) return solid;
 
   // Ortak eksen: her kanalın düzlem eğimi (gx, gy); yön = eğimlerin temel bileşeni
@@ -154,15 +164,19 @@ function fitModel(px: Px, n: number): { paint: Paint; model: Region['model']; rm
     const s0 = stops[0]?.t ?? 0, s1 = stops[stops.length - 1]?.t ?? 1;
     const tA = t0 + s0 * span, tB = t0 + s1 * span;
     const norm = stops.map((s) => ({ t: (s.t - s0) / (s1 - s0 || 1), c: s.c }));
-    const interp = (tt: number, k: number) => {
-      const u = (tt - tA) / (tB - tA || 1);
-      if (u <= 0) return norm[0].c[k];
-      if (u >= 1) return norm[norm.length - 1].c[k];
-      let j = 1; while (j < norm.length - 1 && norm[j].t < u) j++;
-      const a = norm[j - 1], b = norm[j], v = (u - a.t) / (b.t - a.t || 1);
-      return a.c[k] + (b.c[k] - a.c[k]) * v;
+    const fill = () => {
+      const P = new Float32Array(n * C), last = norm[norm.length - 1], span2 = tB - tA || 1;
+      for (let i = 0; i < n; i++) {
+        const u = (tv[i] - tA) / span2, o = i * C;
+        if (u <= 0) { for (let k = 0; k < C; k++) P[o + k] = norm[0].c[k]; continue; }
+        if (u >= 1) { for (let k = 0; k < C; k++) P[o + k] = last.c[k]; continue; }
+        let j = 1; while (j < norm.length - 1 && norm[j].t < u) j++;
+        const a = norm[j - 1], b = norm[j], v = (u - a.t) / (b.t - a.t || 1);
+        for (let k = 0; k < C; k++) P[o + k] = a.c[k] + (b.c[k] - a.c[k]) * v;
+      }
+      return P;
     };
-    return { norm, tA, tB, interp };
+    return { norm, tA, tB, fill };
   };
   const toStops = (norm: { t: number; c: number[] }[]): GradientStop[] => norm.map((s) => ({
     offset: Math.round(s.t * 1e4) / 1e4, color: hex(s.c[0], s.c[1], s.c[2]),
@@ -173,10 +187,11 @@ function fitModel(px: Px, n: number): { paint: Paint; model: Region['model']; rm
   const tl = new Float64Array(n);
   for (let i = 0; i < n; i++) tl[i] = px.x[i] * dir[0] + px.y[i] * dir[1];
   const L = binCurve(tl, 64);
-  const linPred = (i: number, k: number) => L.interp(tl[i], k);
+  const LP = L.fill();
+  const linPred = (i: number, k: number) => LP[i * C + k];
   const linear = {
     paint: { type: 'linear', x1: dir[0] * L.tA, y1: dir[1] * L.tA, x2: dir[0] * L.tB, y2: dir[1] * L.tB, stops: toStops(L.norm) } as Paint,
-    model: 'linear' as const, rms: rmsOf(linPred), pred: linPred,
+    model: 'linear' as const, rms: rmsOf(LP), pred: linPred,
   };
 
   // Radyal: parlaklığa izotropik ikinci derece yüzey uydur → merkez
@@ -196,8 +211,9 @@ function fitModel(px: Px, n: number): { paint: Paint; model: Region['model']; rm
       const tr = new Float64Array(n);
       for (let i = 0; i < n; i++) tr[i] = Math.hypot(px.x[i] - cx, px.y[i] - cy);
       const R = binCurve(tr, 64);
-      const radPred = (i: number, k: number) => R.interp(tr[i], k);
-      const radRms = rmsOf(radPred);
+      const RP = R.fill();
+      const radPred = (i: number, k: number) => RP[i * C + k];
+      const radRms = rmsOf(RP);
       // Radyal gradyan r=0 merkezden başlar: duraklar [tA/tB, 1]'e yerleşir
       if (radRms < best.rms * 0.85 && R.tB > 1) {
         const stops = toStops(R.norm).map((s) => ({ ...s, offset: Math.round(((R.tA + s.offset * (R.tB - R.tA)) / R.tB) * 1e4) / 1e4 }));
@@ -253,29 +269,34 @@ export function segmentRegions(img: Raster, o: SegmentOptions = {}): Segmentatio
   for (let iter = 0; iter < 6; iter++) {
     const area = new Float64Array(count), sL = new Float64Array(count), sA = new Float64Array(count), sB = new Float64Array(count);
     for (let p = 0; p < n; p++) { const l = labels[p]; if (l < 0) continue; area[l]++; sL[l] += L[p]; sA[l] += A[p]; sB[l] += Bc[p]; }
-    const mean = (l: number) => [sL[l] / area[l], sA[l] / area[l], sB[l] / area[l]];
-    const small = new Set<number>();
-    for (let l = 0; l < count; l++) if (area[l] > 0 && area[l] < minArea) small.add(l);
-    if (!small.size) break;
-    const target = new Map<number, number>(), scores = new Map<number, number>();
+    for (let l = 0; l < count; l++) if (area[l] > 0) { sL[l] /= area[l]; sA[l] /= area[l]; sB[l] /= area[l]; }
+    const small = new Uint8Array(count);
+    let anySmall = false;
+    for (let l = 0; l < count; l++) if (area[l] > 0 && area[l] < minArea) { small[l] = 1; anySmall = true; }
+    if (!anySmall) break;
+    const target = new Int32Array(count).fill(-1), scores = new Float64Array(count);
     for (let p = 0; p < n; p++) {
       const l = labels[p];
-      if (!small.has(l)) continue;
+      if (l < 0 || !small[l]) continue;
       const x = p % w;
-      for (const q of [x > 0 ? p - 1 : -1, x < w - 1 ? p + 1 : -1, p >= w ? p - w : -1, p < n - w ? p + w : -1]) {
+      for (let k = 0; k < 4; k++) {
+        const q = k === 0 ? (x > 0 ? p - 1 : -1) : k === 1 ? (x < w - 1 ? p + 1 : -1) : k === 2 ? (p >= w ? p - w : -1) : (p < n - w ? p + w : -1);
         if (q < 0) continue;
         const m = labels[q];
         if (m < 0 || m === l) continue;
-        const ml = mean(l), mm = mean(m);
         // renkçe en yakın komşu; büyük komşu tercih edilir (küçük↔küçük zincirlerini kısaltır)
-        const score = (ml[0] - mm[0]) ** 2 + (ml[1] - mm[1]) ** 2 + (ml[2] - mm[2]) ** 2 - (small.has(m) ? 0 : 1e-3);
-        if (!target.has(l) || score < scores.get(l)!) { target.set(l, m); scores.set(l, score); }
+        const score = (sL[l] - sL[m]) ** 2 + (sA[l] - sA[m]) ** 2 + (sB[l] - sB[m]) ** 2 - (small[m] ? 0 : 1e-3);
+        if (target[l] < 0 || score < scores[l]) { target[l] = m; scores[l] = score; }
       }
     }
-    if (!target.size) break;
+    let anyT = false;
+    for (let l = 0; l < count; l++) if (target[l] >= 0) { anyT = true; break; }
+    if (!anyT) break;
     // Zincirleri çöz
-    const res = (l: number) => { let k = l, g = 0; while (target.has(k) && g++ < 64) k = target.get(k)!; return k; };
-    for (let p = 0; p < n; p++) { const l = labels[p]; if (l >= 0 && target.has(l)) labels[p] = res(l); }
+    const res = (l: number) => { let k = l, g = 0; while (target[k] >= 0 && g++ < 64) k = target[k]; return k; };
+    const final = new Int32Array(count);
+    for (let l = 0; l < count; l++) final[l] = target[l] >= 0 ? res(l) : l;
+    for (let p = 0; p < n; p++) { const l = labels[p]; if (l >= 0) labels[p] = final[l]; }
   }
   // Yeniden sırala
   const remap = new Map<number, number>();
@@ -301,6 +322,7 @@ export function segmentRegions(img: Raster, o: SegmentOptions = {}): Segmentatio
   for (let p = 0; p < n; p++) if (labels[p] >= 0) members[labels[p]].push(p);
   let nextId = 0;
   const out = new Int32Array(n).fill(-1);
+  const mark = new Uint8Array(n);
   const process = (list: number[], depth: number) => {
     const { px, bbox } = collect(list);
     const fit = fitModel(px, list.length);
@@ -317,9 +339,9 @@ export function segmentRegions(img: Raster, o: SegmentOptions = {}): Segmentatio
         const comps = components(out, w).filter((c) => c.length >= minArea);
         const taken = comps.reduce((a, c) => a + c.length, 0);
         if (comps.length && taken < list.length) {
-          const takenSet = new Set<number>();
-          for (const c of comps) for (const p of c) takenSet.add(p);
-          const rest = list.filter((p) => !takenSet.has(p));
+          for (const c of comps) for (const p of c) mark[p] = 1;
+          const rest = list.filter((p) => !mark[p]);
+          for (const c of comps) for (const p of c) mark[p] = 0;
           for (const comp of components(rest, w)) process(comp, depth + 1);
           for (const c of comps) process(c, depth + 1);
           return;
@@ -483,13 +505,99 @@ export interface SoftGroup {
   /** Gauss σ (segmentasyon pikseli). */
   sigma: number;
   halfAlpha: number;
+  /**
+   * Gölge, örtücü nesnenin KAYDIRILMIŞ kopyasıysa (drop shadow) kayma (segmentasyon pikseli). Tanımlıysa şekil =
+   * yarı-alfa üstü yumuşak pikseller ∪ (örtücü + kayma); örtücünün kendisi şekle katılmaz (yoksa kaymanın ters yönünde hale).
+   */
+  shift?: { dx: number; dy: number };
+}
+
+/** Kutu bulanıklığı (3 geçiş ≈ Gauss σ), yerinde; kenarlar sıfır. */
+function gaussBox(a: Float32Array, w: number, h: number, sigma: number) {
+  const r = Math.max(0, Math.round(Math.sqrt((12 * sigma * sigma) / 3 + 1) / 2 - 0.5));
+  if (r < 1) return;
+  const tmp = new Float32Array(a.length), k = 1 / (2 * r + 1);
+  for (let pass = 0; pass < 3; pass++) {
+    for (let y = 0; y < h; y++) { let acc = 0; const row = y * w; for (let x = -r; x <= r; x++) acc += x >= 0 && x < w ? a[row + x] : 0; for (let x = 0; x < w; x++) { tmp[row + x] = acc * k; const add = x + r + 1, sub = x - r; acc += (add < w ? a[row + add] : 0) - (sub >= 0 ? a[row + sub] : 0); } }
+    for (let x = 0; x < w; x++) { let acc = 0; for (let y = -r; y <= r; y++) acc += y >= 0 && y < h ? tmp[y * w + x] : 0; for (let y = 0; y < h; y++) { a[y * w + x] = acc * k; const add = y + r + 1, sub = y - r; acc += (add < h ? tmp[add * w + x] : 0) - (sub >= 0 ? tmp[sub * w + x] : 0); } }
+  }
+}
+
+/**
+ * Kaydırılmış gölgenin σ ve opaklığı: model = opaklık × Gauss(σ) ⊛ (yarı-alfa gölge ∪ kaydırılmış örtücü);
+ * yalnız GÖRÜNEN (örtücü dışı) piksellerdeki alfaya en küçük kareler. Kenar-bandı oranı, örtücünün gizlediği
+ * kenarları da saydığı için σ'yı eksik kestirir.
+ */
+function fitShadow(labels: Int32Array, rgba: Uint8ClampedArray, w: number, h: number, ids: Set<number>, occ: Set<number>, half: number, shift: { dx: number; dy: number }, sigma0: number): { sigma: number; alpha: number; e: number } | null {
+  const f = Math.max(1, Math.round(Math.max(w, h) / 360));
+  const sw = Math.ceil(w / f), sh = Math.ceil(h / f);
+  const shape = new Float32Array(sw * sh), obs = new Float32Array(sw * sh), vis = new Uint8Array(sw * sh);
+  for (let y = 0; y < h; y += f) for (let x = 0; x < w; x += f) {
+    const p = y * w + x, q = ((y / f) | 0) * sw + ((x / f) | 0), l = labels[p];
+    const ox = x - shift.dx, oy = y - shift.dy;
+    const u = ox >= 0 && oy >= 0 && ox < w && oy < h ? labels[oy * w + ox] : -1;
+    shape[q] = (l >= 0 && ids.has(l) && rgba[p * 4 + 3] >= half) || (u >= 0 && occ.has(u)) ? 1 : 0;
+    if (!(l >= 0 && occ.has(l))) { vis[q] = 1; obs[q] = l >= 0 && !ids.has(l) ? -1 : rgba[p * 4 + 3] / 255; }
+  }
+  let best: { sigma: number; alpha: number; e: number } | null = null;
+  for (let m = 0.5; m <= 2.6; m *= 1.12) {
+    const sg = (sigma0 * m) / f;
+    const pred = shape.slice();
+    gaussBox(pred, sw, sh, sg);
+    let num = 0, den = 0;
+    for (let q = 0; q < pred.length; q++) if (vis[q] && obs[q] >= 0) { num += obs[q] * pred[q]; den += pred[q] * pred[q]; }
+    if (den <= 0) continue;
+    const a = Math.min(1, num / den);
+    let e = 0;
+    for (let q = 0; q < pred.length; q++) if (vis[q] && obs[q] >= 0) e += (obs[q] - a * pred[q]) ** 2;
+    if (!best || e < best.e) best = { sigma: sigma0 * m, alpha: a, e };
+  }
+  return best;
+}
+
+/**
+ * Gölge kayması: örtücü (opak komşu) maskeyi (dx,dy) kaydırınca yumuşak gölgenin yarı-alfa bölgesiyle en çok örtüşen,
+ * açık (düşük alfalı/saydam) alanla en az çakışan kayma. Örtücünün kendi pikselleri "bilinmiyor" sayılır.
+ */
+function findShadowShift(labels: Int32Array, rgba: Uint8ClampedArray, w: number, h: number, ids: Set<number>, occ: Set<number>, half: number, sigma: number): { dx: number; dy: number } | null {
+  const n = w * h;
+  const occPts: number[] = [];
+  const state = new Int8Array(n); // 1: gölge (≥ yarı alfa), -1: açık, 0: bilinmiyor (örtücü) / arada
+  let softHalf = 0;
+  for (let p = 0; p < n; p++) {
+    const l = labels[p];
+    if (l >= 0 && occ.has(l)) { occPts.push(p); continue; }
+    const a = rgba[p * 4 + 3];
+    if (l >= 0 && ids.has(l) && a >= half) { state[p] = 1; softHalf++; }
+    else if (l < 0 || (ids.has(l) && a < half * 0.4)) state[p] = -1;
+  }
+  if (!occPts.length || softHalf < 16) return null;
+  const R = Math.min(96, Math.round(6 * sigma + 8));
+  const score = (dx: number, dy: number, stride: number) => {
+    let sc = 0;
+    for (let i = 0; i < occPts.length; i += stride) {
+      const p = occPts[i], x = (p % w) + dx, y = ((p / w) | 0) + dy;
+      if (x < 0 || y < 0 || x >= w || y >= h) continue;
+      sc += state[y * w + x];
+    }
+    return sc * stride;
+  };
+  // Kaba arama (4 px adım, seyrek örnek) → ince arama (±4 px, tüm pikseller)
+  const stride = Math.max(1, Math.floor(occPts.length / 20_000));
+  let best = { dx: 0, dy: 0, s: 0 };
+  for (let dy = -R; dy <= R; dy += 4) for (let dx = -R; dx <= R; dx += 4) { const sc = score(dx, dy, stride); if (sc > best.s) best = { dx, dy, s: sc }; }
+  const c = { ...best };
+  for (let dy = c.dy - 4; dy <= c.dy + 4; dy++) for (let dx = c.dx - 4; dx <= c.dx + 4; dx++) { const sc = score(dx, dy, 1); if (sc > best.s) best = { dx, dy, s: sc }; }
+  // Kayma anlamlı mı: gölgenin görünür yarı-alfa bölgesinin en az %40'ını açıklamalı ve (0,0) değil
+  if ((best.dx === 0 && best.dy === 0) || best.s < softHalf * 0.4) return null;
+  return { dx: best.dx, dy: best.dy };
 }
 
 /**
  * Yumuşak gölge / parıltı tespiti: saydam zemine sönen, aynı renk tonundaki komşu yarı saydam bölgeler tek grup olur.
  * Böyle bir grup "bulanıklaştırılmış tek şekil" ile temsil edilir (tasarımcının drop-shadow/blur efekti) — halkalar yerine.
  */
-export function detectSoftGroups(seg: Segmentation, img: Raster, minArea: number): SoftGroup[] {
+export function detectSoftGroups(seg: Segmentation, img: Raster, minArea: number, scale = 1): SoftGroup[] {
   const { labels, w, h } = seg;
   const n = w * h, rgba = img.rgba;
   const stat = new Map<number, { a: number; r: number; g: number; b: number; wa: number; cnt: number; clear: boolean }>();
@@ -534,22 +642,37 @@ export function detectSoftGroups(seg: Segmentation, img: Raster, minArea: number
     const maxA = alphas[Math.floor(alphas.length * 0.97)] || 255;
     const half = maxA / 2;
     // Geçiş genişliği: %10–%90 bandındaki piksel sayısı / dış sınır uzunluğu  (Gauss kenarında ≈ 2.56σ)
-    let band = 0, rim = 0;
+    let band = 0, rim = 0, perim = 0;
+    const out = (q: number) => labels[q] < 0 || !ids.has(labels[q]);
     for (let p = 0; p < n; p++) {
       if (!ids.has(labels[p])) continue;
       const a = rgba[p * 4 + 3];
       if (a > 0.1 * maxA && a < 0.9 * maxA) band++;
       const x = p % w;
       if ((x > 0 && labels[p - 1] < 0) || (x < w - 1 && labels[p + 1] < 0) || (p >= w && labels[p - w] < 0) || (p < n - w && labels[p + w] < 0)) rim++;
+      if ((x > 0 && out(p - 1)) || (x < w - 1 && out(p + 1)) || (p >= w && out(p - w)) || (p < n - w && out(p + w))) perim++;
     }
+    // Gerçek gölge/parıltı dışa, saydam alana doğru söner: çevresinin anlamlı bir kısmı saydama değer. Opak şeklin
+    // kenar yumuşatma halkası ise çoğunlukla başka bölgelere değer (genişlik ölçüsü güvenilmez → gölge değil).
+    if (rim < perim * 0.2) continue;
     const width = band / Math.max(1, rim);
     // Kenar yumuşatma halkası (~1 px) gölge değildir: gerçek yumuşak geçiş en az ~2.5 px genişliktedir
-    if (width < 2.5) continue;
+    // (büyütülmüş görüntüde segmentasyon yapıldıysa halka `scale` kat genişler)
+    if (width < 2.5 * Math.max(1, scale)) continue;
     const sigma = Math.max(0.5, width / 2.56);
     // Şekil: yumuşak grup + ona bitişik opak bölgeler (gölgeyi düşüren nesne)
     const shapeIds = new Set(ids);
-    for (const i of ids) for (const m of adj.get(i) ?? []) if (!translucent(m)) shapeIds.add(m);
-    groups.push({ ids, shapeIds, rgb: [r / wa, g / wa, b / wa], alpha: maxA / 255, sigma, halfAlpha: half });
+    const occ = new Set<number>();
+    for (const i of ids) for (const m of adj.get(i) ?? []) if (!translucent(m)) { shapeIds.add(m); occ.add(m); }
+    let shift = findShadowShift(labels, rgba, w, h, ids, occ, half, sigma) ?? undefined;
+    let fit = shift ? fitShadow(labels, rgba, w, h, ids, occ, half, shift, sigma) : null;
+    if (shift && fit) {
+      // Kaymasız model (gölge = nesnenin altı) aynı ölçütle: kayma ancak belirgin daha iyiyse kullanılır
+      // (küçük kaymalı gölgede kaymasız model daha doğru; kayma modeli nesne kenarında boşluk bırakır)
+      const f0 = fitShadow(labels, rgba, w, h, ids, occ, half, { dx: 0, dy: 0 }, sigma);
+      if (f0 && f0.e <= fit.e * 0.7) { shift = undefined; fit = null; }
+    }
+    groups.push({ ids, shapeIds, rgb: [r / wa, g / wa, b / wa], alpha: fit?.alpha ?? maxA / 255, sigma: fit?.sigma ?? sigma, halfAlpha: half, ...(shift ? { shift } : {}) });
   }
   return groups;
 }

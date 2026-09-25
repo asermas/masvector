@@ -147,8 +147,61 @@ describe('raster izleme', () => {
     x.fillStyle = '#2a9d8f'; x.beginPath(); x.roundRect(40, 30, 160, 160, 28); x.fill();
     const buf = c.toBuffer('image/png');
     const r = await vectorizeImageToDoc(buf);
-    const hasAlpha = vectorPaths(r.doc).some((p) => (p.style.fillOpacity ?? 1) < 1 || (typeof p.style.fill !== 'string' && p.style.fill.stops.some((s) => (s.opacity ?? 1) < 1)));
+    const hasAlpha = vectorPaths(r.doc).some((p) => (p.style.fillOpacity ?? 1) < 1 || (p.style.opacity ?? 1) < 1 || (typeof p.style.fill !== 'string' && p.style.fill.stops.some((s) => (s.opacity ?? 1) < 1)));
     expect(hasAlpha).toBe(true);
     expect(r.report.fidelity!.pctOff).toBeLessThan(1);
+  }, 120_000);
+});
+
+describe('v1.1 zor girdiler', () => {
+  const doc1 = (r: { doc: VDocument }) => r.doc;
+  it('1–2 px ince çizgiler kaybolmaz (ince yapı renkleri + çizgi benzeri piksel atama)', async () => {
+    const c = createCanvas(600, 400); const x = c.getContext('2d');
+    x.fillStyle = '#fff'; x.fillRect(0, 0, 600, 400);
+    x.strokeStyle = '#141414'; x.lineWidth = 12; x.beginPath(); x.moveTo(20, 380); x.lineTo(580, 20); x.stroke();
+    x.lineWidth = 1; x.beginPath(); x.moveTo(20, 20); x.lineTo(580, 380); x.stroke();
+    x.strokeStyle = '#c80000'; x.lineWidth = 1.5; x.beginPath(); x.arc(300, 200, 120, 0, Math.PI * 2); x.stroke();
+    const r = await vectorizeImageToDoc(c.toBuffer('image/png'));
+    const paths = vectorPaths(doc1(r));
+    // kırmızı çember çizgisi ayrı renk olarak geri kazanılır; 1 px siyah çizgi silinmez
+    expect(paths.some((p) => { const f = String(p.style.fill); return /^#[a-f0-9]{6}$/.test(f) && parseInt(f.slice(1, 3), 16) > 150 && parseInt(f.slice(3, 5), 16) < 90; })).toBe(true);
+    expect(r.report.fidelity!.pctOff).toBeLessThan(1);
+  }, 120_000);
+
+  it('kaydırılmış yumuşak gölge: bulanık şekil kaymayla yerleşir, hale oluşmaz', async () => {
+    const c = createCanvas(400, 300); const x = c.getContext('2d');
+    x.shadowColor = 'rgba(0,0,0,0.6)'; x.shadowBlur = 30; x.shadowOffsetX = 18; x.shadowOffsetY = 26;
+    x.fillStyle = '#ffffff'; x.beginPath(); x.roundRect(70, 50, 220, 160, 24); x.fill();
+    const r = await vectorizeImageToDoc(c.toBuffer('image/png'));
+    expect(r.report.fidelity!.pctOff).toBeLessThan(0.5);
+    const blurred = vectorPaths(doc1(r)).filter((p) => p.style.filters.some((f) => f.type === 'blur'));
+    expect(blurred.length).toBe(1);
+  }, 120_000);
+
+  it('dama / titreşim deseni ve 16 px ikon: piksel-birebir, anında', async () => {
+    const c = createCanvas(64, 64); const x = c.getContext('2d');
+    for (let i = 0; i < 64; i++) for (let j = 0; j < 64; j++) { x.fillStyle = (i + j) % 2 ? '#000' : '#fff'; x.fillRect(i, j, 1, 1); }
+    const t = Date.now();
+    const r = await vectorizeImageToDoc(c.toBuffer('image/png'));
+    expect(Date.now() - t).toBeLessThan(3000);
+    expect(r.report.fidelity!.pctOff).toBe(0);
+    expect(r.report.warnings.join(' ')).toMatch(/piksel-birebir/);
+    const s = createCanvas(16, 16); const y = s.getContext('2d');
+    y.fillStyle = '#193373'; y.beginPath(); y.roundRect(1.5, 1.5, 13, 13, 3); y.fill(); y.fillStyle = '#d91933'; y.beginPath(); y.arc(8, 7, 3.3, 0, 7); y.fill();
+    const q = await vectorizeImageToDoc(s.toBuffer('image/png'));
+    expect(q.report.fidelity!.pctOff).toBeLessThan(0.5);
+  }, 60_000);
+
+  it('gürültülü logo: ölçüt kenar koruyan temizlenmiş kaynağa karşı, fotoğraf uyarısı yok', async () => {
+    const c = createCanvas(300, 300); const x = c.getContext('2d');
+    x.fillStyle = '#fff'; x.fillRect(0, 0, 300, 300); x.fillStyle = '#193373'; x.fillRect(40, 40, 220, 220); x.fillStyle = '#d91933'; x.beginPath(); x.arc(150, 150, 70, 0, 7); x.fill();
+    const d = x.getImageData(0, 0, 300, 300);
+    let seed = 7; const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+    for (let i = 0; i < d.data.length; i += 4) for (let k = 0; k < 3; k++) d.data[i + k] = Math.max(0, Math.min(255, d.data[i + k] + (rnd() + rnd() + rnd() - 1.5) * 40));
+    x.putImageData(d, 0, 0);
+    const r = await vectorizeImageToDoc(c.toBuffer('image/png'));
+    expect(r.report.fidelity!.pctOff).toBeLessThan(0.5);
+    expect(r.report.warnings.join(' ')).not.toMatch(/Fotoğraf/);
+    expect(vectorPaths(doc1(r)).length).toBeLessThanOrEqual(4);
   }, 120_000);
 });

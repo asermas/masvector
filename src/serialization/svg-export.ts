@@ -2,7 +2,11 @@ import type { Filter, Frame, Paint, Style, SubPath, VDocument, VNode } from '../
 import { toSvgTransform } from '../math/matrix.js';
 import { toPathData } from './path-data.js';
 
-export const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+// XML 1.0'da yasak karakterler (sekme/satır sonu dışındaki kontrol karakterleri, eşlenmemiş vekil yarımlar) atılır:
+// aksi hâlde dışa aktarılan SVG geçersiz XML olur ve tarayıcılar/editörler dosyayı açmaz.
+// eslint-disable-next-line no-control-regex
+const XML_INVALID = /[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+export const esc = (s: string) => s.replace(XML_INVALID, '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const n = (v: number) => String(Math.round(v * 1000) / 1000);
 
 class Defs {

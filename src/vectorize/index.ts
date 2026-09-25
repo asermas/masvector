@@ -6,7 +6,8 @@ import { createDocument } from '../model/scene.js';
 import { decodeImageBuffer, type DecodedImage } from '../render/png.js';
 import { rgbaToDataUri } from '../render/image-ops.js';
 import { traceImage, type TraceOptions, type TraceResult } from './trace.js';
-import { compareDocument, median3, type CompareMetrics } from './compare.js';
+import { exactColorCount, pixelEdgeDensity, pixelTrace } from './pixel.js';
+import { cleanReference, compareDocument, type CompareMetrics } from './compare.js';
 import { importPDF, type PdfImportOptions } from './pdf.js';
 
 // Üst düzey vektörleştirme API'si: Document Server, MCP ve CLI aynı fonksiyonları kullanır.
@@ -55,11 +56,12 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
   const attempts: VectorizeReport['attempts'] = [];
   let ref: { rgba: Uint8ClampedArray; width: number; height: number } | null = null;
   let refKind: 'kaynak' | 'gürültüsü giderilmiş kaynak' = 'kaynak';
-  const evaluate = async (opts: TraceOptions) => {
-    const r = await traceImage(img, opts);
+  const evaluate = async (opts: TraceOptions, pixel = false) => {
+    const r = pixel ? pixelTrace(img) : await traceImage(img, opts);
     // Gürültülü kaynakta (JPEG vb.) ölçüt, gürültüyü değil şekli ölçsün: 3×3 medyanla temizlenmiş kaynağa karşı
     if (!ref) {
-      if (r.stats.noise > 0.5 || o.lossySource) { ref = { rgba: median3(img.rgba, img.width, img.height), width: img.width, height: img.height }; refKind = 'gürültüsü giderilmiş kaynak'; }
+      // (çok küçük görselde "gürültü" kenar yumuşatmasıdır, ayrıntıdır: temizlenmez)
+      if ((r.stats.noise > 0.5 && Math.min(img.width, img.height) >= 64) || o.lossySource) { ref = { rgba: cleanReference(img.rgba, img.width, img.height, r.stats.noise), width: img.width, height: img.height }; refKind = 'gürültüsü giderilmiş kaynak'; }
       else ref = { rgba: img.rgba, width: img.width, height: img.height };
     }
     const doc = createDocument('t', r.width, r.height);
@@ -67,19 +69,39 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
     f.background = r.background ?? 'none';
     f.nodes = [r.group];
     const m = { ...compareDocument(doc, ref).metrics, reference: refKind };
-    attempts.push({ options: { colors: opts.colors, detail: opts.detail, maxColors: opts.maxColors, smoothness: opts.smoothness, gradients: opts.gradients }, pctOff: m.pctOff, anchors: r.stats.anchors });
+    attempts.push({ options: { colors: opts.colors, detail: opts.detail, maxColors: opts.maxColors, smoothness: opts.smoothness, gradients: opts.gradients, ...(opts.segScale ? { segScale: opts.segScale } : {}) }, pctOff: m.pctOff, anchors: r.stats.anchors });
     return { r, m };
   };
+  // Dama / titreşim (dither) deseni: az sayıda TAM renk + komşuların çoğu farklı → pürüzsüz izleme temsil edemez
+  // (dakikalar sürer ve zayıf kalır); doğrudan piksel-birebir
+  if (o.refine !== false && !o.palette?.length && exactColorCount(img, 64) <= 64 && pixelEdgeDensity(img) > 0.25) {
+    return { ...(await evaluate({ ...o }, true)), attempts };
+  }
   // Palet (düz renk) ve gradyan kiplerini ikisini de dene, ölçüte göre seç (sınıflandırma yanılabilir)
   let best = await evaluate(o);
-  if (o.gradients === undefined && !o.palette?.length) {
-    const usedGradients = best.r.group.children.some((c) => c.type === 'path' && typeof c.style.fill !== 'string') || /bölge/.test(best.r.group.name ?? '');
+  const usedGradients = best.r.group.children.some((c) => c.type === 'path' && typeof c.style.fill !== 'string') || /bölge/.test(best.r.group.name ?? '');
+  // Düz renk sonucu zaten ≤%0.3 ise gradyan kipi seçilemez (karmaşık sonuç ancak ≥0.3 puan iyileştirirse kazanır): deneme atlanır
+  if (o.gradients === undefined && !o.palette?.length && !(!usedGradients && best.m.pctOff <= 0.3)) {
     const alt = await evaluate({ ...o, gradients: !usedGradients });
     // Daha basit sonuç (daha az çapa) tercih edilir; karmaşık olan ancak hatayı belirgin VE mutlak olarak azaltıyorsa seçilir
     const [simple, complex] = alt.r.stats.anchors <= best.r.stats.anchors ? [alt, best] : [best, alt];
-    const complexWins = complex.m.pctOff < simple.m.pctOff * 0.6 && simple.m.pctOff - complex.m.pctOff > 0.3;
+    // Karmaşıklık cezası: basit sonuç zaten çok iyiyse (≤%1.5) ve karmaşık olan ≥3× çapa kullanıyorsa basit kalır
+    // (JPEG'li küçük logoda 4 temiz renk, onlarca renk bölgesinden oluşan "daha sadık" sonuçtan iyidir)
+    const overfit = simple.m.pctOff <= 1.5 && complex.r.stats.anchors >= 3 * Math.max(1, simple.r.stats.anchors);
+    const complexWins = !overfit && complex.m.pctOff < simple.m.pctOff * 0.6 && simple.m.pctOff - complex.m.pctOff > 0.3;
     const better = (complexWins ? complex : simple) === alt;
     if (better) best = alt;
+  }
+  // Gradyan kipinde küçük görsel: segmentasyonu 2.5× büyütülmüş görüntüde de dene (ince ayrıntılı ikonlarda daha iyi)
+  const gradBest = best.r.group.children.some((c) => c.type === 'path' && typeof c.style.fill !== 'string') || /bölge/.test(best.r.group.name ?? '');
+  if (o.refine !== false && gradBest && o.segScale === undefined && best.r.scale >= 2.5 && best.m.pctOff > 0.3) {
+    // Ölçüm: en iyi ölçek görsele göre değişiyor (2.5× ya da tam çalışma ölçeği k) — ikisi de denenir
+    // (bellek/süre sınırı: büyütülmüş segmentasyon ≤ 1.7 MP)
+    for (const ss of [...new Set([2.5, best.r.scale])].filter((v) => v * v * img.width * img.height <= 1.7e6)) {
+      const c = await evaluate({ ...o, gradients: true, segScale: ss });
+      if (c.m.pctOff < best.m.pctOff * 0.8) best = c;
+      if (best.m.pctOff <= 0.3) break;
+    }
   }
   if (o.refine !== false && !o.palette?.length && best.m.pctOff > 0.5 && best.r.preset !== 'photo') {
     const tries: TraceOptions[] = [
@@ -93,6 +115,20 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
       if (best.m.pctOff <= 0.5) break;
     }
   }
+  // Sert kenarlı piksel grafiği (az sayıda TAM renk) ya da çok küçük görsel ve pürüzsüz izleme zayıfsa:
+  // piksel-birebir vektör (piksel sanatı, 1-bit titreşimli, 1 px desen, 16–64 px ikonlar)
+  if (o.refine !== false && !o.palette?.length && best.m.pctOff > 0.5) {
+    const n = img.width * img.height;
+    // Çok küçük görsel ya da kısa kenarı ≤32 px şerit: 1 px'lik ayrıntılar pürüzsüz yorumla temsil edilemez
+    const tiny = n <= 1024 || Math.min(img.width, img.height) <= 32;
+    const exact = exactColorCount(img, tiny ? 4096 : 64);
+    if (exact <= 64 || (tiny && exact <= 4096)) {
+      const c = await evaluate({ ...o }, true);
+      if (c.m.pctOff < best.m.pctOff * 0.5) best = c;
+    }
+  }
+  // Sonuç iyiyse "fotoğraf benzeri" uyarısı yanıltıcıdır (ör. gürültülü logo): kaldır
+  if (best.m.pctOff <= 0.5) best.r.warnings = best.r.warnings.filter((w) => !w.startsWith('Fotoğraf benzeri'));
   return { ...best, attempts };
 }
 
