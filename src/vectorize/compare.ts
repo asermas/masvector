@@ -41,6 +41,8 @@ function flatten(px: Uint8ClampedArray): Uint8ClampedArray {
   return o;
 }
 
+const clamp8 = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
+
 export function compareRGBA(ref: Uint8ClampedArray, out: Uint8ClampedArray, w: number, h: number): { metrics: CompareMetrics; diffMask: Uint8Array } {
   const A = flatten(ref), B = flatten(out);
   const n = w * h;
@@ -69,26 +71,29 @@ export function compareRGBA(ref: Uint8ClampedArray, out: Uint8ClampedArray, w: n
       const xx = x + dx, yy = y + dy;
       if (xx >= 0 && yy >= 0 && xx < w && yy < h) nb.push((yy * w + xx) * 3);
     }
-    const explain = (P: Float32Array, Q: Float32Array) => {
+    // Karışım sRGB'de olur (kenar yumuşatma, yeniden örnekleme): P, iki komşunun sRGB karışım doğrusundaki en yakın
+    // noktaya OKLab'da ölçülür. Yeniden örnekleme filtreleri (Lanczos vb.) keskin kenarda uçların ±%15 ötesine
+    // taşar (çınlama); vektör render'ı bunu üretemez, hata sayılmaz.
+    const explain = (PL: Float32Array, PS: Uint8ClampedArray, QL: Float32Array, QS: Uint8ClampedArray) => {
       let bestD = Infinity;
       for (let a = 0; a < nb.length && bestD > THRESH; a++) {
         const qa = nb[a];
-        const da = Math.sqrt((P[i] - Q[qa]) ** 2 + (P[i + 1] - Q[qa + 1]) ** 2 + (P[i + 2] - Q[qa + 2]) ** 2);
+        const da = Math.sqrt((PL[i] - QL[qa]) ** 2 + (PL[i + 1] - QL[qa + 1]) ** 2 + (PL[i + 2] - QL[qa + 2]) ** 2);
         if (da < bestD) bestD = da;
         for (let b = a + 1; b < nb.length && bestD > THRESH; b++) {
           const qb = nb[b];
-          // P[i]'nin [Q[qa], Q[qb]] doğru parçasına uzaklığı
-          const vx = Q[qb] - Q[qa], vy = Q[qb + 1] - Q[qa + 1], vz = Q[qb + 2] - Q[qa + 2];
+          const vx = QS[qb] - QS[qa], vy = QS[qb + 1] - QS[qa + 1], vz = QS[qb + 2] - QS[qa + 2];
           const vv = vx * vx + vy * vy + vz * vz;
-          if (vv < 1e-9) continue;
-          const t = Math.max(0, Math.min(1, ((P[i] - Q[qa]) * vx + (P[i + 1] - Q[qa + 1]) * vy + (P[i + 2] - Q[qa + 2]) * vz) / vv));
-          const dd = Math.sqrt((P[i] - Q[qa] - t * vx) ** 2 + (P[i + 1] - Q[qa + 1] - t * vy) ** 2 + (P[i + 2] - Q[qa + 2] - t * vz) ** 2);
+          if (vv < 1) continue;
+          const t = Math.max(-0.15, Math.min(1.15, ((PS[i] - QS[qa]) * vx + (PS[i + 1] - QS[qa + 1]) * vy + (PS[i + 2] - QS[qa + 2]) * vz) / vv));
+          const c = rgbToOklab(clamp8(QS[qa] + t * vx), clamp8(QS[qa + 1] + t * vy), clamp8(QS[qa + 2] + t * vz));
+          const dd = Math.sqrt((PL[i] - c[0]) ** 2 + (PL[i + 1] - c[1]) ** 2 + (PL[i + 2] - c[2]) ** 2);
           if (dd < bestD) bestD = dd;
         }
       }
       return bestD;
     };
-    const best = explain(LA, LB), best2 = explain(LB, LA);
+    const best = explain(LA, A, LB, B), best2 = explain(LB, B, LA, A);
     if (best > THRESH || best2 > THRESH) { tol++; diffMask[p] = 1; }
   }
   const mse = sumSq / (n * 3);
@@ -138,10 +143,14 @@ export function median3(rgba: Uint8ClampedArray, w: number, h: number): Uint8Cla
  * rengi merkezden `3.5 × gürültü`den az farklı komşuların ortalamasını alır: gerçek renk sınırları korunur, tanecik silinir.
  * `noise`: ortalama mutlak sapma (0–255, estimateNoise).
  */
-export function cleanReference(rgba: Uint8ClampedArray, w: number, h: number, noise: number): Uint8ClampedArray {
-  let a = median3(rgba, w, h);
-  if (noise < 3) return a;
-  const T = 3.5 * noise, R = noise > 8 ? 3 : 2;
+export function cleanReference(rgba: Uint8ClampedArray, w: number, h: number, noise: number, lossy = false): Uint8ClampedArray {
+  // Kayıplı kaynakta (JPEG) blok/çınlama gürültüsü düz bölgede ölçülemez: taban 4
+  const nz = Math.max(noise, lossy ? 4 : 0);
+  if (nz < 2) return rgba;
+  // Medyan 1 px çizgileri siler: yalnız yüksek (tuz-biber benzeri) gürültüde. Sigma süzgeci ince yapıları korur
+  // (çizgi pikseli komşularından T'den çok farklıdır, ortalamaya katılmaz).
+  let a = nz > 8 ? median3(rgba, w, h) : rgba;
+  const T = 3.5 * nz, R = nz > 8 ? 3 : 2;
   for (let pass = 0; pass < 2; pass++) {
     const out = new Uint8ClampedArray(a);
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
@@ -181,7 +190,31 @@ export function diffHeatmapPNG(ref: Uint8ClampedArray, mask: Uint8Array, w: numb
 }
 
 /** Belgeyi referans boyutunda render edip karşılaştır. `hide` id'leri (ör. referans katmanı) render dışı tutulur. */
-export function compareDocument(doc: VDocument, ref: { rgba: Uint8ClampedArray; width: number; height: number }, opts: { frameId?: string; hide?: string[]; region?: { x: number; y: number; width: number; height: number } } = {}) {
+/**
+ * JPEG renk alt örneklemesi (4:2:0) renk bilgisini kenarın ~1 px dışına taşırır; vektör bunu üretmemeli. Kayıplı
+ * kaynakta KARŞILAŞTIRMANIN iki tarafına da aynı renk (Cb/Cr) yumuşatması uygulanır: parlaklık (Y) kenarları piksel
+ * hassasiyetinde ölçülmeye devam eder, yalnız JPEG'in zaten attığı renk çözünürlüğü eşitlenir.
+ */
+export function chromaSmooth(px: Uint8ClampedArray, w: number, h: number): Uint8ClampedArray {
+  const n = w * h, Y = new Float32Array(n), Cb = new Float32Array(n), Cr = new Float32Array(n);
+  for (let p = 0; p < n; p++) {
+    const r = px[p * 4], g = px[p * 4 + 1], b = px[p * 4 + 2];
+    Y[p] = 0.299 * r + 0.587 * g + 0.114 * b; Cb[p] = -0.168736 * r - 0.331264 * g + 0.5 * b; Cr[p] = 0.5 * r - 0.418688 * g - 0.081312 * b;
+  }
+  const blur = (a: Float32Array) => { // 3×3 çadır (≈ 2× alt örnekleme + çift doğrusal büyütme)
+    const t = new Float32Array(n), o = new Float32Array(n);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const p = y * w + x; t[p] = (a[p] * 2 + a[y * w + Math.max(0, x - 1)] + a[y * w + Math.min(w - 1, x + 1)]) / 4; }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const p = y * w + x; o[p] = (t[p] * 2 + t[Math.max(0, y - 1) * w + x] + t[Math.min(h - 1, y + 1) * w + x]) / 4; }
+    return o;
+  };
+  const cb = blur(Cb), cr = blur(Cr), out = new Uint8ClampedArray(px);
+  for (let p = 0; p < n; p++) {
+    out[p * 4] = Y[p] + 1.402 * cr[p]; out[p * 4 + 1] = Y[p] - 0.344136 * cb[p] - 0.714136 * cr[p]; out[p * 4 + 2] = Y[p] + 1.772 * cb[p];
+  }
+  return out;
+}
+
+export function compareDocument(doc: VDocument, ref: { rgba: Uint8ClampedArray; width: number; height: number }, opts: { frameId?: string; hide?: string[]; region?: { x: number; y: number; width: number; height: number }; chroma?: boolean } = {}) {
   const clone: VDocument = opts.hide?.length ? structuredClone(doc) : doc;
   if (opts.hide?.length) {
     const hide = new Set(opts.hide);
@@ -189,6 +222,8 @@ export function compareDocument(doc: VDocument, ref: { rgba: Uint8ClampedArray; 
     for (const p of clone.pages) for (const f of p.frames) visit(f.nodes);
   }
   const r = renderRGBA(clone, { frameId: opts.frameId, width: ref.width, height: ref.height, background: true, region: opts.region });
-  const { metrics, diffMask } = compareRGBA(ref.rgba, r.rgba, ref.width, ref.height);
+  const A = opts.chroma ? chromaSmooth(ref.rgba, ref.width, ref.height) : ref.rgba;
+  const B = opts.chroma ? chromaSmooth(r.rgba, ref.width, ref.height) : r.rgba;
+  const { metrics, diffMask } = compareRGBA(A, B, ref.width, ref.height);
   return { metrics, heatmap: () => diffHeatmapPNG(ref.rgba, diffMask, ref.width, ref.height), rendered: r.rgba };
 }

@@ -37,6 +37,19 @@ export function pixelEdgeDensity(img: DecodedImage): number {
   return tot ? diff / tot : 0;
 }
 
+/** Komşu pikseller arası ortalama mutlak kanal farkı (0–255): saf gürültüde ~85, fotoğrafta ~5–15. */
+export function neighborDiff(img: DecodedImage): number {
+  const { width: W, height: H, rgba } = img;
+  let sum = 0, cnt = 0;
+  const step = Math.max(1, Math.floor((W * H) / 100_000));
+  for (let p = 0; p < W * H - 1; p += step) {
+    if (p % W === W - 1) continue;
+    for (let c = 0; c < 3; c++) sum += Math.abs(rgba[p * 4 + c] - rgba[(p + 1) * 4 + c]);
+    cnt += 3;
+  }
+  return cnt ? sum / cnt : 0;
+}
+
 export function pixelTrace(img: DecodedImage): TraceResult {
   const t0 = Date.now();
   const { width: W, height: H, rgba } = img;

@@ -236,7 +236,10 @@ function thinColors(img: Raster, lab: Float32Array, flat: Uint8Array, centers: L
   }
   // En uç renkler önce: ardından gelen ara tonlar (ör. kırmızı çizginin pembe yumuşatması) yeni renkle açıklanıyorsa eklenmez
   const out: Lab[] = [];
-  for (const c of cands.sort((a, b) => b.u - a.u)) if (unexplained(c.col, [...centers, ...out]) > 0.05 ** 2) out.push(c.col);
+  // Mevcut bir palet rengine çok yakınsa (ör. #0a0a0a metin + çınlamayla dışdeğerlenmiş #000) ayrı renk değildir:
+  // aynı şekil iki etikete benek benek bölünür
+  const tooClose = (c: Lab) => [...centers, ...out].some((q) => d2(q, c) < 0.2 ** 2);
+  for (const c of cands.sort((a, b) => b.u - a.u)) if (unexplained(c.col, [...centers, ...out]) > 0.05 ** 2 && !tooClose(c.col)) out.push(c.col);
   return out;
 }
 
@@ -302,10 +305,9 @@ export function labelize(img: Raster, pal: Palette, alphaCut = 128): Int16Array 
       let a = -1, b = -1;
       for (let d = 1; d <= 10 && a < 0; d++) { const xx = x + dx * d, yy = y + dy * d; if (xx < 0 || yy < 0 || xx >= w || yy >= h) break; const q = yy * w + xx; if (flat[q] === 2) a = out[q]; }
       for (let d = 1; d <= 10 && b < 0; d++) { const xx = x - dx * d, yy = y - dy * d; if (xx < 0 || yy < 0 || xx >= w || yy >= h) break; const q = yy * w + xx; if (flat[q] === 2) b = out[q]; }
-      // Gerçek ince çizgi en az iki eksende (dik + köşegen) aynı zemini görür; kenar saçağı en çok birinde
-      if (a >= 0 && a === b && ++hits >= 2) return true;
+      if (a >= 0 && a === b) hits++;
     }
-    return false;
+    return hits;
   };
   // Düz bölgelerden içeri doğru yay (her tur bir piksel)
   for (let pass = 0; pass < 6 && pending.length; pass++) {
@@ -324,10 +326,15 @@ export function labelize(img: Raster, pal: Palette, alphaCut = 128): Int16Array 
       // Komşu renklerin tekiyle/karışımıyla açıklanamayan piksel (ince çizgi, küçük metin): tüm palete açılır
       if (K > 1) {
         const c: Lab = [lab[p * 3], lab[p * 3 + 1], lab[p * 3 + 2]];
-        if (unexplained(c, [...cand].map((i) => pal.colors[i])) > 0.05 ** 2 && lineLike(p)) {
+        const hits = unexplained(c, [...cand].map((i) => pal.colors[i])) > 0.05 ** 2 ? lineLike(p) : 0;
+        if (hits) {
           const m = mixLabel(c, cand, pal.colors, allIdx);
           // Yalnız zemin + tek renk karışımıyla gerçekten açıklanıyorsa (ΔE < 0.04) ince yapı sayılır
-          if (m.x >= 0 && m.d2 < 0.04 ** 2) { thin.set(p, m); assign.push([p, m.a]); continue; }
+          // (İnce yapı rengi hedefse gevşek: kesişimlerde piksel üç rengin karışımıdır, hiçbir çifte tam oturmaz)
+          // Düz renge (kalın şeklin rengi) atama sıkı: iki eksende aynı zemin + iyi karışım (kenar saçağı değil).
+          // İnce yapı rengine gevşek: kesişimde diğer çizgi iki ekseni kapatır ve piksel üç rengin karışımıdır.
+          const ok = pal.thin?.[m.x] ? m.d2 < 0.12 ** 2 : hits >= 2 && m.d2 < 0.04 ** 2;
+          if (m.x >= 0 && ok) { thin.set(p, m); assign.push([p, m.a]); continue; }
         }
       }
       assign.push([p, nearest(p, cand)]);
@@ -365,7 +372,21 @@ export function labelize(img: Raster, pal: Palette, alphaCut = 128): Int16Array 
           if (!seen[q] && mq && out[q] === m0.x) { seen[q] = 1; stack.push(q); }
         }
       }
-      if (comp.length < 12) for (const p of comp) out[p] = thin.get(p)!.a;
+      // Kısa bileşen yalnız iki FARKLI düz rengin sınırındaysa saçaktır (logo kenarı); tek zemin üstündeyse küçük
+      // metin/nokta gibi gerçek ayrıntıdır → korunur
+      if (comp.length < 12) {
+        const around = new Set<number>();
+        for (const p of comp) {
+          const x = p % w, y = (p / w) | 0;
+          for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+            const xx = x + dx, yy = y + dy;
+            if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+            const q = yy * w + xx;
+            if (flat[q] === 2 && out[q] >= 0 && out[q] !== m0.x) around.add(out[q]);
+          }
+        }
+        if (around.size >= 2) for (const p of comp) out[p] = thin.get(p)!.a;
+      }
     }
   }
   for (const p of pending) out[p] = nearest(p); // düz komşusu olmayanlar (foto/gradyan)
@@ -399,7 +420,7 @@ export function modeFilter(lab: Int16Array, w: number, h: number, passes = 1): I
 }
 
 /** `minArea`dan küçük bağlı bileşenleri (4-komşuluk) en çok sınır paylaştıkları etikete kat (lekeleri sil). */
-export function removeSpeckles(lab: Int16Array, w: number, h: number, minArea: number): number {
+export function removeSpeckles(lab: Int16Array, w: number, h: number, minArea: number, protect?: (label: number) => boolean): number {
   if (minArea <= 1) return 0;
   const n = w * h;
   const seen = new Uint8Array(n);
@@ -430,7 +451,7 @@ export function removeSpeckles(lab: Int16Array, w: number, h: number, minArea: n
         else if (size < minArea) { if (bcnt[lq + 1]++ === 0) touched.push(lq + 1); }
       }
     }
-    if (size < minArea && touched.length) {
+    if (size < minArea && touched.length && !(protect && v >= 0 && protect(v))) {
       let bv = v, bc = -1;
       for (const t of touched) if (bcnt[t] > bc) { bc = bcnt[t]; bv = t - 1; }
       for (let i = 0; i < size; i++) lab[comp[i]] = bv;
@@ -439,4 +460,138 @@ export function removeSpeckles(lab: Int16Array, w: number, h: number, minArea: n
     for (const t of touched) bcnt[t] = 0;
   }
   return removed;
+}
+
+/**
+ * Kaplama tabanlı etiketleme (kaynak çözünürlüğünde çöz, çalışma çözünürlüğüne alt piksel doğrulukla taşı).
+ * 1) Her kaynak pikseli: düz ise tek renk; değilse çevresindeki (r≤3) düz renkler + ince yapı renkleri arasından
+ *    sRGB karışım doğrusuna en iyi oturan çift → iki rengin kaplaması (1−t, t). Alfa, "saydam" etiketin kaplamasıdır.
+ * 2) İnce yapı: bir rengin kaplaması 5×5 komşulukta hiç 1'e ulaşmıyorsa (küçük metin, kıl çizgi) yerel tepeye
+ *    göre normalize edilir; aksi hâlde %50 eşiğinin altında kalıp silinirdi.
+ * 3) Çalışma pikseli, kaynak kaplamalarının bilinear ara değerinde en büyük kaplamalı renge atanır: sınırlar tam
+ *    %50 kaplama çizgisine oturur (büyütülmüş RGB'de en-yakın-renk kararı koyu renkler aleyhine yanlıydı).
+ */
+export function coverageLabels(src: Raster, pal: Palette, W: number, H: number, alphaCut = 128): Int16Array {
+  const { w, h, rgba } = src;
+  const n = w * h;
+  const { lab, flat } = analyze(src, alphaCut);
+  const K = pal.colors.length;
+  const TR = K; // saydam etiketin iç dizini
+  const thinIdx = (pal.thin ?? []).flatMap((t, i) => (t ? [i] : []));
+  const nearestAll = (p: number) => {
+    let bd = Infinity, li = 0;
+    for (let i = 0; i < K; i++) { const c = pal.colors[i]; const dd = (lab[p * 3] - c[0]) ** 2 + (lab[p * 3 + 1] - c[1]) ** 2 + (lab[p * 3 + 2] - c[2]) ** 2; if (dd < bd) { bd = dd; li = i; } }
+    return { li, d2: bd };
+  };
+  // Saf piksel etiketleri: düz ya da bir palet rengine ΔE < 0.03 (1 px çizginin ortası düz değildir ama saftır —
+  // aday renkler yalnız düz piksellerden toplanırsa ince çizginin rengi komşularına hiç aday olmaz, çizgi incelir)
+  const flatLab = new Int16Array(n).fill(-1);
+  for (let p = 0; p < n; p++) {
+    if (rgba[p * 4 + 3] < alphaCut) continue;
+    const one = nearestAll(p);
+    if (flat[p] === 2 || one.d2 < 0.03 ** 2) flatLab[p] = one.li;
+  }
+  // Saf ama düz olmayan piksel, iki FARKLI düz rengin sınırındaysa ve çevresinde kendi renginden düz piksel yoksa
+  // renk saçağıdır (alt piksel metin yumuşatması): saf sayılmaz. 1 px çizgi tek zemin üstündedir → saf kalır.
+  for (let p = 0; p < n; p++) {
+    const c = flatLab[p];
+    if (c < 0 || flat[p] === 2) continue;
+    const x = p % w, y = (p / w) | 0;
+    let own = false; const others = new Set<number>();
+    for (let dy = -3; dy <= 3 && !own; dy++) for (let dx = -3; dx <= 3; dx++) {
+      const xx = x + dx, yy = y + dy;
+      if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+      const q = yy * w + xx;
+      if (flat[q] !== 2 || rgba[q * 4 + 3] < alphaCut) continue;
+      const v = nearestAll(q).li;
+      if (v === c) { own = true; break; }
+      others.add(v);
+    }
+    if (!own && others.size >= 2) flatLab[p] = -1;
+  }
+  // Piksel başına en çok iki etiket + kaplama
+  const L1 = new Int16Array(n), L2 = new Int16Array(n).fill(-1), T2 = new Float32Array(n);
+  const cand: number[] = [];
+  for (let p = 0; p < n; p++) {
+    const A = rgba[p * 4 + 3];
+    if (A < 8) { L1[p] = TR; continue; }
+    const R = rgba[p * 4], G = rgba[p * 4 + 1], B = rgba[p * 4 + 2];
+    const one = nearestAll(p);
+    // Yarı saydam kenar: renk + saydam karışımı
+    if (A < 250) { L1[p] = one.li; L2[p] = TR; T2[p] = 1 - A / 255; continue; }
+    if (flatLab[p] >= 0 || one.d2 < 0.03 ** 2) { L1[p] = flatLab[p] >= 0 ? flatLab[p] : one.li; continue; }
+    cand.length = 0;
+    const x = p % w, y = (p / w) | 0;
+    for (let dy = -3; dy <= 3; dy++) for (let dx = -3; dx <= 3; dx++) {
+      const xx = x + dx, yy = y + dy;
+      if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+      const v = flatLab[yy * w + xx];
+      if (v >= 0 && !cand.includes(v)) cand.push(v);
+    }
+    for (const t of thinIdx) if (!cand.includes(t)) cand.push(t);
+    // Pikselin kendi en-yakın rengi yalnız çevrede hiç saf renk yoksa aday: aksi hâlde alt piksel renk saçağı
+    // (lacivert metnin macenta kenarı) çevrede olmayan bir renge (kırmızı) karışım sanılır
+    if (cand.length < 2 && !cand.includes(one.li)) cand.push(one.li);
+    let bd = Infinity, ba = one.li, bb = -1, bt = 0;
+    for (let i = 0; i < cand.length; i++) for (let j = i + 1; j < cand.length; j++) {
+      const Pa = pal.rgb[cand[i]], Pb = pal.rgb[cand[j]];
+      const v0 = Pb[0] - Pa[0], v1 = Pb[1] - Pa[1], v2 = Pb[2] - Pa[2], LL = v0 * v0 + v1 * v1 + v2 * v2;
+      if (LL < 1) continue;
+      const t = Math.min(1, Math.max(0, ((R - Pa[0]) * v0 + (G - Pa[1]) * v1 + (B - Pa[2]) * v2) / LL));
+      const dd = (R - Pa[0] - t * v0) ** 2 + (G - Pa[1] - t * v1) ** 2 + (B - Pa[2] - t * v2) ** 2;
+      if (dd < bd) { bd = dd; ba = cand[i]; bb = cand[j]; bt = t; }
+    }
+    // Hiçbir çifte oturmuyorsa (renk saçağı, gürültü, üç renk kesişimi): ÇEVREDEKİ adaylardan en yakını
+    if (bb < 0 || bd > 40 * 40) {
+      let cd = Infinity, cl = one.li;
+      for (const c of cand) { const q = pal.colors[c]; const dd = (lab[p * 3] - q[0]) ** 2 + (lab[p * 3 + 1] - q[1]) ** 2 + (lab[p * 3 + 2] - q[2]) ** 2; if (dd < cd) { cd = dd; cl = c; } }
+      L1[p] = cl; continue;
+    }
+    L1[p] = ba; L2[p] = bb; T2[p] = bt;
+  }
+  // İnce yapı normalizasyonu: rengin 5×5 komşuluktaki en yüksek kaplaması < 1 ise kaplamayı tepeye göre ölçekle
+  const covOf = (p: number, c: number) => (L1[p] === c ? (L2[p] >= 0 ? 1 - T2[p] : 1) : 0) + (L2[p] === c ? T2[p] : 0);
+  const boost = new Float32Array(n).fill(1);
+  for (let p = 0; p < n; p++) {
+    if (L2[p] < 0 || L2[p] === TR) continue;
+    // Karışımda azınlıkta kalan renk (ön plan adayı)
+    const fg = T2[p] <= 0.5 ? L2[p] : L1[p];
+    const x = p % w, y = (p / w) | 0;
+    let peak = 0;
+    for (let dy = -2; dy <= 2 && peak < 1; dy++) for (let dx = -2; dx <= 2; dx++) {
+      const xx = x + dx, yy = y + dy;
+      if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+      const cv = covOf(yy * w + xx, fg);
+      if (cv > peak) peak = cv;
+    }
+    // Yalnız %50 eşiğini hiç geçemeyecek darbeler güçlendirilir (tepe → 0.6); yeterince koyu darbeler şişirilmez
+    if (peak > 0.15 && peak < 0.5) boost[p] = 0.6 / peak;
+  }
+  // Çalışma çözünürlüğüne taşı: bilinear kaplama, argmax
+  const out = new Int16Array(W * H);
+  const sx = w / W, sy = h / H;
+  const acc = new Float32Array(K + 1);
+  const touched: number[] = [];
+  const put = (l: number, v: number) => { if (acc[l] === 0) touched.push(l); acc[l] += v; };
+  const add = (p: number, wt: number) => {
+    const a = L1[p], c = L2[p], T = T2[p];
+    if (c < 0) { put(a, wt); return; }
+    if (c === TR) { put(a, wt * (1 - T)); put(TR, wt * T); return; }
+    // Azınlıktaki (ön plan) rengin kaplaması ince yapı normalizasyonuyla güçlendirilir; zemin tamamlayanı alır
+    const minL = T <= 0.5 ? c : a, majL = T <= 0.5 ? a : c;
+    const mc = Math.min(1, (T <= 0.5 ? T : 1 - T) * boost[p]);
+    put(minL, wt * mc); put(majL, wt * (1 - mc));
+  };
+  for (let Y = 0; Y < H; Y++) {
+    const fy = Math.min(h - 1, Math.max(0, (Y + 0.5) * sy - 0.5)), y0 = Math.floor(fy), y1 = Math.min(h - 1, y0 + 1), ay = fy - y0;
+    for (let X = 0; X < W; X++) {
+      const fx = Math.min(w - 1, Math.max(0, (X + 0.5) * sx - 0.5)), x0 = Math.floor(fx), x1 = Math.min(w - 1, x0 + 1), ax = fx - x0;
+      add(y0 * w + x0, (1 - ax) * (1 - ay)); add(y0 * w + x1, ax * (1 - ay)); add(y1 * w + x0, (1 - ax) * ay); add(y1 * w + x1, ax * ay);
+      let best = -1, bv = -1;
+      for (const l of touched) { if (acc[l] > bv) { bv = acc[l]; best = l; } acc[l] = 0; }
+      touched.length = 0;
+      out[Y * W + X] = best === TR ? -1 : best;
+    }
+  }
+  return out;
 }

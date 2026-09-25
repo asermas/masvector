@@ -28,8 +28,10 @@ if (process.env.MV_STRESS_ONE) {
     const buf = readFileSync(file);
     const reps: any[] = [];
     let doc: any;
-    if (isPdf(file, buf)) { const r = await pdfToDoc(file); doc = r.doc; reps.push(...r.reports); }
-    else { const r = await vectorizeImageToDoc(buf); doc = r.doc; reps.push(r.report); }
+    // MV_OPTS: karşılaştırma koşuları için ek seçenekler (JSON)
+    const extra = process.env.MV_OPTS ? JSON.parse(process.env.MV_OPTS) : {};
+    if (isPdf(file, buf)) { const r = await pdfToDoc(file, { trace: extra }); doc = r.doc; reps.push(...r.reports); }
+    else { const r = await vectorizeImageToDoc(buf, extra); doc = r.doc; reps.push(r.report); }
     const ms = performance.now() - t0;
     let paths = 0, anchors = 0;
     for (const f of doc.pages[0].frames) for (const w of walk(f.nodes)) if (w.node.type === 'path') { paths++; for (const sp of w.node.subpaths) anchors += sp.points.length; }

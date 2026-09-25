@@ -6,7 +6,7 @@ import { createDocument } from '../model/scene.js';
 import { decodeImageBuffer, type DecodedImage } from '../render/png.js';
 import { rgbaToDataUri } from '../render/image-ops.js';
 import { traceImage, type TraceOptions, type TraceResult } from './trace.js';
-import { exactColorCount, pixelEdgeDensity, pixelTrace } from './pixel.js';
+import { exactColorCount, neighborDiff, pixelEdgeDensity, pixelTrace } from './pixel.js';
 import { cleanReference, compareDocument, type CompareMetrics } from './compare.js';
 import { importPDF, type PdfImportOptions } from './pdf.js';
 
@@ -61,24 +61,31 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
     // Gürültülü kaynakta (JPEG vb.) ölçüt, gürültüyü değil şekli ölçsün: 3×3 medyanla temizlenmiş kaynağa karşı
     if (!ref) {
       // (çok küçük görselde "gürültü" kenar yumuşatmasıdır, ayrıntıdır: temizlenmez)
-      if ((r.stats.noise > 0.5 && Math.min(img.width, img.height) >= 64) || o.lossySource) { ref = { rgba: cleanReference(img.rgba, img.width, img.height, r.stats.noise), width: img.width, height: img.height }; refKind = 'gürültüsü giderilmiş kaynak'; }
+      if ((r.stats.noise > 2 && Math.min(img.width, img.height) >= 64) || o.lossySource) { ref = { rgba: cleanReference(img.rgba, img.width, img.height, r.stats.noise, !!o.lossySource), width: img.width, height: img.height }; refKind = 'gürültüsü giderilmiş kaynak'; }
       else ref = { rgba: img.rgba, width: img.width, height: img.height };
     }
     const doc = createDocument('t', r.width, r.height);
     const f = doc.pages[0].frames[0];
     f.background = r.background ?? 'none';
     f.nodes = [r.group];
-    const m = { ...compareDocument(doc, ref).metrics, reference: refKind };
+    // Piksel-birebir aday HAM kaynağa karşı ölçülür: kaynağın her pikselini (gürültüsü dahil) içerik sayar
+    const m = pixel ? { ...compareDocument(doc, { rgba: img.rgba, width: img.width, height: img.height }).metrics, reference: 'kaynak' as const } : { ...compareDocument(doc, ref, { chroma: !!o.lossySource }).metrics, reference: refKind };
     attempts.push({ options: { colors: opts.colors, detail: opts.detail, maxColors: opts.maxColors, smoothness: opts.smoothness, gradients: opts.gradients, ...(opts.segScale ? { segScale: opts.segScale } : {}) }, pctOff: m.pctOff, anchors: r.stats.anchors });
     return { r, m };
   };
-  // Dama / titreşim (dither) deseni: az sayıda TAM renk + komşuların çoğu farklı → pürüzsüz izleme temsil edemez
+  // Dama / titreşim (dither) deseni (az TAM renk + komşuların çoğu farklı) ya da saf gürültü/doku (komşu farkı çok
+  // yüksek): pürüzsüz izleme temsil edemez
   // (dakikalar sürer ve zayıf kalır); doğrudan piksel-birebir
-  if (o.refine !== false && !o.palette?.length && exactColorCount(img, 64) <= 64 && pixelEdgeDensity(img) > 0.25) {
+  if (o.refine !== false && !o.palette?.length && ((exactColorCount(img, 64) <= 64 && pixelEdgeDensity(img) > 0.25) || (img.width * img.height <= 262_144 && neighborDiff(img) > 40))) {
     return { ...(await evaluate({ ...o }, true)), attempts };
   }
   // Palet (düz renk) ve gradyan kiplerini ikisini de dene, ölçüte göre seç (sınıflandırma yanılabilir)
   let best = await evaluate(o);
+  // Umutsuz (>%20; saf gürültü/doku) ve ≤ 512²: diğer pürüzsüz denemeler boşuna — doğrudan piksel-birebir
+  if (o.refine !== false && !o.palette?.length && best.m.pctOff > 20 && img.width * img.height <= 262_144) {
+    const c = await evaluate({ ...o }, true);
+    if (c.m.pctOff < best.m.pctOff * 0.5) return { ...c, attempts };
+  }
   const usedGradients = best.r.group.children.some((c) => c.type === 'path' && typeof c.style.fill !== 'string') || /bölge/.test(best.r.group.name ?? '');
   // Düz renk sonucu zaten ≤%0.3 ise gradyan kipi seçilemez (karmaşık sonuç ancak ≥0.3 puan iyileştirirse kazanır): deneme atlanır
   if (o.gradients === undefined && !o.palette?.length && !(!usedGradients && best.m.pctOff <= 0.3)) {
@@ -87,7 +94,9 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
     const [simple, complex] = alt.r.stats.anchors <= best.r.stats.anchors ? [alt, best] : [best, alt];
     // Karmaşıklık cezası: basit sonuç zaten çok iyiyse (≤%1.5) ve karmaşık olan ≥3× çapa kullanıyorsa basit kalır
     // (JPEG'li küçük logoda 4 temiz renk, onlarca renk bölgesinden oluşan "daha sadık" sonuçtan iyidir)
-    const overfit = simple.m.pctOff <= 1.5 && complex.r.stats.anchors >= 3 * Math.max(1, simple.r.stats.anchors);
+    // (yalnız AYNI kalite kademesinde: karmaşık sonuç bir üst kademeye çıkıyorsa — ör. çok iyi → mükemmel — ceza yok)
+    const tier = (p: number) => (p < 0.25 ? 0 : p < 1 ? 1 : p < 3 ? 2 : 3);
+    const overfit = simple.m.pctOff <= 1.5 && tier(complex.m.pctOff) >= tier(simple.m.pctOff) && complex.r.stats.anchors >= 3 * Math.max(1, simple.r.stats.anchors);
     const complexWins = !overfit && complex.m.pctOff < simple.m.pctOff * 0.6 && simple.m.pctOff - complex.m.pctOff > 0.3;
     const better = (complexWins ? complex : simple) === alt;
     if (better) best = alt;
@@ -122,7 +131,9 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
     // Çok küçük görsel ya da kısa kenarı ≤32 px şerit: 1 px'lik ayrıntılar pürüzsüz yorumla temsil edilemez
     const tiny = n <= 1024 || Math.min(img.width, img.height) <= 32;
     const exact = exactColorCount(img, tiny ? 4096 : 64);
-    if (exact <= 64 || (tiny && exact <= 4096)) {
+    // Son çare: hiçbir pürüzsüz yorum tutmuyorsa (>%5 hata; ör. saf gürültü, doku) ve görsel ≤ 512² ise piksel-birebir
+    const hopeless = best.m.pctOff > 5 && n <= 262_144;
+    if (exact <= 64 || (tiny && exact <= 4096) || hopeless) {
       const c = await evaluate({ ...o }, true);
       if (c.m.pctOff < best.m.pctOff * 0.5) best = c;
     }

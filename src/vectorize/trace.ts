@@ -7,8 +7,9 @@ import { VectorError } from '../common/errors.js';
 import { parsePathData } from '../serialization/path-data.js';
 import { transformSubPath, flattenSubPaths, segments, subpathsBBox } from '../math/bezier.js';
 import { fitClosedPolygon } from '../math/fit.js';
+import { extractStrokes } from './stroke.js';
 import { decodeImageBuffer, type DecodedImage } from '../render/png.js';
-import { extractPalette, labelize, modeFilter, removeSpeckles, rgbToOklab, type Palette, type Raster } from './quantize.js';
+import { coverageLabels, extractPalette, labelize, modeFilter, removeSpeckles, rgbToOklab, type Palette, type Raster } from './quantize.js';
 
 // Raster → vektör izleme hattı:
 //  1) çöz + gerekirse büyüt (küçük görsellerde pürüzsüz kenar için)
@@ -40,6 +41,8 @@ export interface TraceOptions {
   method?: 'overlap' | 'stacked' | 'abutting';
   /** Yumuşak geçişleri gerçek doğrusal/radyal gradyan olarak geri kazan (varsayılan: illustration/photo'da açık). */
   gradients?: boolean;
+  /** (Gelişmiş) Palet kipi etiketleme: coverage (varsayılan) ya da legacy (büyütülmüş RGB'de en-yakın renk). */
+  labeling?: 'coverage' | 'legacy';
   /** (Gelişmiş) Küçük görsellerde gradyan segmentasyonunun büyütme ölçeği (varsayılan 1 = kaynak çözünürlüğü). */
   segScale?: number;
 }
@@ -341,9 +344,10 @@ export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions =
     // Çizim/gri tonlu: renk sayısı otomatik (saf siyah-beyazda dirsek 2'de durur; gri tonlu logolar tonlarını korur)
     else if (preset === 'lineart') pal = extractPalette(img, { k: o.colors, maxK: o.maxColors ?? 8, targetError: 0.016 });
     else pal = extractPalette(img, { k: o.colors, maxK: o.maxColors ?? (preset === 'logo' ? 16 : preset === 'illustration' ? 32 : 48), targetError: preset === 'photo' ? 0.03 : 0.016 });
-    lab = labelize(img, pal);
+    lab = o.labeling === 'legacy' ? labelize(img, pal) : coverageLabels({ w: W, h: H, rgba: src.rgba }, pal, w, h);
     lab = modeFilter(lab, w, h, detail > 0.8 ? 0 : 1);
-    speckles = removeSpeckles(lab, w, h, speckleArea);
+    // İnce yapı renkleri (küçük metin, 1 px çizgi parçaları) leke sayılmaz
+    speckles = removeSpeckles(lab, w, h, speckleArea, (v) => !!pal.thin?.[v]);
     fills = pal.rgb.map(hex);
     models = fills.map(() => 'solid');
     pal.thin?.forEach((t, i) => { if (t) thinLabels.add(i); });
@@ -411,6 +415,54 @@ export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions =
   // Yarı saydam boyalar (fillOpacity<1 ya da opaklıklı gradyan durağı): taşma yapılmaz ve altlarına taşırılmaz
   // (üst üste binen yarı saydamlık iki kat koyulaşır)
   // (ölçüm: yalnız bulanık yumuşak katmanlarda gerekli; kenar yumuşatma halkalarında taşma daha doğru sonuç veriyor)
+  // Stroke çıkarımı için: rengin kaplama haritası t (0 zemin … 1 tam renk). Zemin = düz (ince olmayan) palet
+  // renklerinden piksele karışım doğrusu en iyi oturan.
+  const solidRgb = fills.map((f, i) => (typeof f === 'string' && !thinLabels.has(i) ? parseHex(f.slice(0, 7)) : null));
+  const strokeLayer = (ci: number, bx0: number, by0: number, cw: number, chh: number, cLab: Int16Array) => {
+    const C = parseHex((fills[ci] as string).slice(0, 7));
+    const m = new Uint8Array(cw * chh), tm = new Float32Array(cw * chh);
+    for (let y = 0; y < chh; y++) for (let x = 0; x < cw; x++) {
+      const q = y * cw + x, p = (y + by0) * w + x + bx0;
+      m[q] = cLab[q] === ci ? 1 : 0;
+      const R = img.rgba[p * 4], G = img.rgba[p * 4 + 1], B = img.rgba[p * 4 + 2];
+      let bd = Infinity, bt = 0;
+      for (const bg of solidRgb) {
+        if (!bg) continue;
+        const v0 = C[0] - bg[0], v1 = C[1] - bg[1], v2 = C[2] - bg[2], L = v0 * v0 + v1 * v1 + v2 * v2;
+        if (L < 1) continue;
+        const t = Math.min(1, Math.max(0, ((R - bg[0]) * v0 + (G - bg[1]) * v1 + (B - bg[2]) * v2) / L));
+        const dd = (R - bg[0] - t * v0) ** 2 + (G - bg[1] - t * v1) ** 2 + (B - bg[2] - t * v2) ** 2;
+        if (dd < bd) { bd = dd; bt = t; }
+      }
+      tm[q] = bd < 45 * 45 ? bt : m[q];
+    }
+    // Köprü yalnız boşluktaki kaynak pikseller zeminden belirgin farklıysa (kesişim karışımı); harf aralığı zemindir
+    const gapOk = (a: { x: number; y: number }, b: { x: number; y: number }) => {
+      let dark = 0, n = 0;
+      const L = Math.hypot(b.x - a.x, b.y - a.y), steps = Math.max(2, Math.ceil(L));
+      for (let i = 1; i < steps; i++) {
+        const x = Math.floor(a.x + ((b.x - a.x) * i) / steps), y = Math.floor(a.y + ((b.y - a.y) * i) / steps);
+        if (x < 0 || y < 0 || x >= cw || y >= chh) continue;
+        n++;
+        if (tm[y * cw + x] > 0.25 || (cLab[y * cw + x] >= 0 && thinLabels.has(cLab[y * cw + x]) && cLab[y * cw + x] !== ci)) { dark++; continue; }
+        const p = (y + by0) * w + x + bx0;
+        let near = Infinity;
+        for (const bg of solidRgb) if (bg) near = Math.min(near, (img.rgba[p * 4] - bg[0]) ** 2 + (img.rgba[p * 4 + 1] - bg[1]) ** 2 + (img.rgba[p * 4 + 2] - bg[2]) ** 2);
+        if (near > 40 * 40) dark++;
+      }
+      return n > 0 && dark >= 0.6 * n;
+    };
+    const st = extractStrokes(m, tm, cw, chh, 3.5 * Math.max(1, k), gapOk);
+    if (!st) return null;
+    const subpaths = st.subpaths.map((sp) => transformSubPath(sp, { a: inv, b: 0, c: 0, d: inv, e: bx0 * inv, f: by0 * inv }));
+    const hexC = (fills[ci] as string).slice(0, 7);
+    const node: PathNode = {
+      type: 'path', id: newId('path'), name: `Çizgi ${hexC}`, transform: { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 },
+      style: defaultStyle({ fill: 'none', stroke: hexC, strokeWidth: Math.round((st.width * inv) * 1000) / 1000, strokeLinecap: 'round', strokeLinejoin: 'round' }),
+      visible: true, locked: false, subpaths: subpaths.map((sp) => ({ ...sp, points: sp.points.map(round3) })), fillRule: 'nonzero',
+    };
+    return { node, anchors: subpaths.reduce((a, sp) => a + sp.points.length, 0) };
+  };
   const translucent = new Uint8Array(K);
   for (const i of softByLabel.keys()) translucent[i] = 1;
   for (let r = 0; r < order.length; r++) {
@@ -434,6 +486,15 @@ export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions =
       cLab[y * cw + x] = v;
       mask[y * cw + x] = v < 0 ? 0 : method === 'stacked' ? (rank[v] >= r ? 1 : 0) : (v === ci ? 1 : 0);
     }
+    // İnce yapı rengi: önce merkez çizgisi (stroke) dene — 1–2 px çizgide dış hattan çok daha doğru
+    if (thinLabels.has(ci) && typeof fills[ci] === 'string' && method !== 'stacked') {
+      const st = strokeLayer(ci, bx0, by0, cw, chh, cLab);
+      if (st) {
+        layers.push(st.node); anchors += st.anchors; subpathCount += st.node.subpaths.length;
+        palOut.push({ color: fills[ci] as string, coverage: Math.round((10000 * area[ci]) / (w * h)) / 100, paths: st.node.subpaths.length, anchors: st.anchors });
+        continue;
+      }
+    }
     const soft = softByLabel.get(ci);
     if (soft) {
       // Şekil maskesi: grup pikselleri (yarı-alfa üstü) ∪ gölgeyi düşüren opak bölgeler — segmentasyondan en-yakın örnekle
@@ -453,7 +514,7 @@ export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions =
       }
     } else if (method === 'overlap' && !translucent[ci]) dilateInto(mask, cLab, rank, r, cw, chh, bleed, translucent);
     smoothMask(mask, cw, chh, thinLabels.has(ci) ? 0 : blurR);
-    let sps = (await traceMask(mask, cw, chh, cfg)).map((sp) => transformSubPath(sp, { a: 1, b: 0, c: 0, d: 1, e: bx0, f: by0 }));
+    let sps = (await traceMask(mask, cw, chh, thinLabels.has(ci) ? { ...cfg, speckle: 1 } : cfg)).map((sp) => transformSubPath(sp, { a: 1, b: 0, c: 0, d: 1, e: bx0, f: by0 }));
     // Düzeltme + çapa azaltma (uydurma), sonra orijinal ölçeğe
     sps = sps.map((sp) => {
       const st = straighten(sp, 0.35 * Math.max(1, k));
@@ -573,3 +634,4 @@ function round3(p: SubPath['points'][number]) {
   if (p.out) q.out = { dx: r3(p.out.dx), dy: r3(p.out.dy) };
   return q;
 }
+
