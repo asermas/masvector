@@ -1,6 +1,6 @@
 {
   "name": "masvector-claude",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "MasVector — ajantların MCP ile profesyonel vektör çizim yaptığı Electron editörü (Claude sürümü)",
   "type": "module",
   "main": "src/ui/electron/main.cjs",

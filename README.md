@@ -55,7 +55,7 @@ node dist/bin/mcp-stdio.js --workspace ./cizim --serve-ui 7880   # tarayıcıda 
 ## Windows (.exe) ve paketleme
 
 ```bash
-npm run dist:win     # → release/MasVector-Kurulum-1.0.0.exe (NSIS kurulum) + MasVector-1.0.0-win.zip (taşınabilir)
+npm run dist:win     # → release/MasVector-Kurulum-1.1.0.exe (NSIS kurulum) + MasVector-1.1.0-win.zip (taşınabilir)
 npm run dist:linux   # → AppImage + .deb
 ```
 
@@ -118,10 +118,15 @@ npm run vectorize -- kurumsal.png --palette "#d91933,#193373,#f3a619"
   3. Modelin açıklayamadığı piksel kümeleri ayrı bölge olur (gradyan zemin üstündeki düşük kontrastlı şekiller).
   4. Saydam zemine sönen yumuşak gölge ve parıltılar halka halka değil, **bulanıklık filtreli tek şekil** olarak çıkar.
 
+- **İnce yapılar (1.1):** 1–2 px çizgiler ve küçük metin hiç düz piksel içermez. Palet renkleriyle ya da karışımlarıyla açıklanamayan, iki yanında aynı zemin olan pikseller ayrıca kümelenir. Renk, kenar yumuşatmasının ötesine (tam kaplamaya) dışdeğerlenir. JPEG çınlaması ve bölge kenarı saçakları bu yola girmez.
+- **Kaydırılmış gölge (1.1):** drop shadow'da örtücü nesnenin kayması aranır. σ ve opaklık, "kaydırılmış şekil ⊛ Gauss" modelinin görünen alfaya uydurulmasıyla bulunur.
+- **Piksel-birebir kip (1.1):** dama, titreşimli (dithered) 1-bit görseller, piksel sanatı, ≤32 px ikonlar ve ince şeritler, TAM renk başına birleştirilmiş dikdörtgenlerle kesin vektöre çevrilir. Pürüzsüz yorum için `refine: false` kullanın.
+- **Karmaşıklık cezası (1.1):** basit sonuç zaten çok iyiyse (≤%1,5), 3 kattan fazla çapa kullanan "daha sadık" sonuç seçilmez. JPEG'li küçük logoda onlarca renk bölgesi yerine 4 temiz renk çıkar.
+
 **Doğrulama ölçütü:**
 - Algısal renk farkı (OKLab ΔE > 0,04) üzerinden hesaplanır.
 - 1 px konum ve kenar yumuşatma karışımı toleranslıdır.
-- JPEG gibi kayıplı kaynaklarda gürültüsü giderilmiş kaynağa karşı ölçülür.
+- JPEG gibi kayıplı ya da gürültülü kaynaklarda, kenar koruyan süzgeçle (medyan + sigma) temizlenmiş kaynağa karşı ölçülür. ≤64 px görsellerde temizlenmez, çünkü orada "gürültü" ayrıntıdır.
 - Karar: < %0,25 **mükemmel**, < %1 **çok iyi**.
 
 Ölçülmüş sonuçlar (Ubuntu sistem görselleri + test fikstürleri):
@@ -140,6 +145,19 @@ npm run vectorize -- kurumsal.png --palette "#d91933,#193373,#f3a619"
 | Fotoğraf (Red Acer 4K) | foto | %0,44 | çok iyi | 844 / 71 k (2,5 MB) |
 | Taranmış PDF | raster sayfa | %0,10 | mükemmel | 3 |
 | Vektör PDF | yol + metin + görsel | %0,04 | mükemmel | 8 |
+
+**Stres testi (1.1):** `npm run stress` 46 zor girdi üretir ve her birini ayrı süreçte ölçer. Girdiler: 1×1 ile 3000² arası boyutlar, 6000×160 panorama, 20×900 şerit, kıl çizgiler, 8–110 px metin, doğrusal/radyal/bantlı gradyan, yarı saydam örtüşme, kaydırılmış yumuşak gölge, JPEG q10/q30, bulanık, gürültülü, perspektifli "telefon fotoğrafı", 64 renk, piksel sanatı, 1 px dama, saf gürültü, CMYK/EXIF/16-bit/1-bit/GIF/WebP/BMP/TIFF, bozuk dosyalar, eğik ve çok sayfalı taranmış PDF.
+
+| | 1.0 | 1.1 |
+|---|---|---|
+| Mükemmel / çok iyi / iyi / zayıf (+3 bozuk dosya: anlamlı hata) | 25 / 5 / 6 / 7 | 30 / 7 / 4 / 2 |
+| 512 px logo | 6,2 s | 1,0 s |
+| Bulanık logo | 25,7 s (%0,92) | 8,0 s (%0,20) |
+| 1 px dama / 1-bit titreşim | 99 s / 87 s (zayıf) | 0,1 s / 0,2 s (%0) |
+| Kaydırılmış yumuşak gölge | %13,7 | %0,002 |
+| Gürültülü logo (σ≈18) | %4,9 | %0,10 |
+
+Zayıf kalan iki girdi: 1 px kenar yumuşatmalı kıl çizgiler (%7,8; kusursuz geometriyle çizilmiş vektör bile bu kaynağa göre %1,4 alır) ve saf rastgele gürültü (vektörle temsil edilemez).
 
 ## MCP yüzeyi
 
@@ -177,6 +195,7 @@ npm run vectorize -- kurumsal.png --palette "#d91933,#193373,#f3a619"
 
 ## Bilinen sınırlar
 
+- 1 px kenar yumuşatmalı kıl çizgiler dış hat olarak izlenir: renk ve süreklilik doğrudur ama kalınlık/konum ±0,5 px dalgalanabilir (merkez çizgisi/stroke çıkarımı yok).
 - Fotoğraflar vektörleştirilebilir ama sonuç ağırdır (binlerce şekil) ve fotoğrafik ayrıntı basitleşir; vektör, logo/illüstrasyon/çizim için doğru araçtır.
 - SVG yalnız doğrusal/radyal gradyanı destekler: karmaşık 2B renk geçişleri birkaç gradyan bölgesine bölünür (yakından bakınca hafif dikiş görülebilir).
 - PDF içe aktarma poppler-utils gerektirir (`sudo apt install poppler-utils`). PDF metinleri glif eğrisi olarak gelir (görünüm birebir, düzenlenebilir metin değil).

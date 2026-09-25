@@ -25,7 +25,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  */
 export function createMcpServer(backend: Backend, opts: McpOptions): McpServer {
   const server = new McpServer(
-    { name: opts.name ?? 'masvector', version: '1.0.0' },
+    { name: opts.name ?? 'masvector', version: '1.1.0' },
     { instructions: AGENT_GUIDE, capabilities: { logging: {} } },
   );
   const agent = () => (typeof opts.agentId === 'function' ? opts.agentId() : opts.agentId);

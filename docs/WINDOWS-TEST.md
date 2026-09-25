@@ -1,4 +1,4 @@
-# MasVector 1.0.0 Beta — Windows test planı
+# MasVector 1.1.0 — Windows test planı
 
 Bu belge Windows'ta çalışan bir Claude oturumu (Claude Code) ya da elle test eden biri için yazıldı.
 Komutlar **PowerShell** içindir. Her adımın sonunda **Beklenen** sonucu kontrol et ve en alttaki
@@ -10,7 +10,7 @@ sonraki bağımsız adımla devam et.
 > uygulamanın kendi komutuyla yazılır. Test bitince kaldırma adımı (9) isteğe bağlıdır; kullanıcıya sor.
 
 - Depo: https://github.com/asermas/masvector
-- Sürüm: https://github.com/asermas/masvector/releases/tag/v1.0.0
+- Sürüm: https://github.com/asermas/masvector/releases/tag/v1.1.0
 
 ---
 
@@ -34,10 +34,10 @@ kısımları "atlandı" olarak raporlanır.
 ```powershell
 $T = Join-Path $env:USERPROFILE "Downloads\masvector-test"
 New-Item -ItemType Directory -Force $T | Out-Null
-$base = "https://github.com/asermas/masvector/releases/download/v1.0.0"
-Invoke-WebRequest "$base/MasVector-Kurulum-1.0.0.exe" -OutFile "$T\MasVector-Kurulum-1.0.0.exe"
+$base = "https://github.com/asermas/masvector/releases/download/v1.1.0"
+Invoke-WebRequest "$base/MasVector-Kurulum-1.1.0.exe" -OutFile "$T\MasVector-Kurulum-1.1.0.exe"
 Invoke-WebRequest "$base/SHA256SUMS.txt" -OutFile "$T\SHA256SUMS.txt"
-$h = (Get-FileHash "$T\MasVector-Kurulum-1.0.0.exe" -Algorithm SHA256).Hash.ToLower()
+$h = (Get-FileHash "$T\MasVector-Kurulum-1.1.0.exe" -Algorithm SHA256).Hash.ToLower()
 $beklenen = (Select-String "MasVector-Kurulum" "$T\SHA256SUMS.txt").Line.Split(" ")[0]
 "hesaplanan: $h"; "beklenen:   $beklenen"; "eşleşiyor: $($h -eq $beklenen)"
 ```
@@ -51,7 +51,7 @@ $beklenen = (Select-String "MasVector-Kurulum" "$T\SHA256SUMS.txt").Line.Split("
 Sessiz kurulum (sihirbazsız):
 
 ```powershell
-Start-Process "$T\MasVector-Kurulum-1.0.0.exe" -ArgumentList "/S" -Wait
+Start-Process "$T\MasVector-Kurulum-1.1.0.exe" -ArgumentList "/S" -Wait
 $APP = Join-Path $env:LOCALAPPDATA "Programs\MasVector"
 $EXE = Join-Path $APP "MasVector.exe"
 Test-Path $EXE
