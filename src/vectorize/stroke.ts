@@ -169,7 +169,7 @@ export interface StrokeResult { subpaths: SubPath[]; width: number; length: numb
  * `mask`: rengin piksel maskesi (çalışma çözünürlüğü), `t`: kaplama haritası (aynı boyut). Genişlik ve koordinatlar
  * çalışma pikseli cinsindendir. Çizgi değilse (ortalama genişlik > maxWidth) null.
  */
-export function extractStrokes(mask: Uint8Array, t: Float32Array, w: number, h: number, maxWidth: number, gapOk: (a: P, b: P) => boolean): StrokeResult | null {
+export function extractStrokes(mask: Uint8Array, t: Float32Array, w: number, h: number, maxWidth: number, gapOk: (a: P, b: P) => boolean, minLenFactor = 1.2, precisionOnly = false, validMask?: Uint8Array): StrokeResult | null {
   let area = 0;
   for (let i = 0; i < w * h; i++) if (mask[i]) area++;
   if (!area) return null;
@@ -181,11 +181,12 @@ export function extractStrokes(mask: Uint8Array, t: Float32Array, w: number, h: 
   const cs = chains(sk, w, h);
   const widths: number[] = [];
   const R = Math.ceil(maxWidth) + 2;
-  const refined: { pts: P[]; closed: boolean; len: number }[] = [];
+  const refined: { pts: P[]; closed: boolean; len: number; cv?: number }[] = [];
   for (const c of cs) {
     const n = c.pts.length;
     if (n < 2) continue;
     const pts: P[] = [];
+    const cw: number[] = [];
     for (let i = 0; i < n; i++) {
       const a = c.pts[Math.max(0, i - 2)], b = c.pts[Math.min(n - 1, i + 2)];
       let dx = b.x - a.x, dy = b.y - a.y;
@@ -195,12 +196,21 @@ export function extractStrokes(mask: Uint8Array, t: Float32Array, w: number, h: 
       let s0 = 0, s1 = 0;
       for (let s = -R; s <= R; s += 0.25) { const v = sampleT(t, w, h, c.pts[i].x + nx * s, c.pts[i].y + ny * s); s0 += v; s1 += v * s; }
       const off = s0 > 1e-6 ? Math.max(-1.5, Math.min(1.5, s1 / s0)) : 0;
-      widths.push(s0 * 0.25);
+      widths.push(s0 * 0.25); cw.push(s0 * 0.25);
       pts.push({ x: c.pts[i].x + nx * off, y: c.pts[i].y + ny * off });
     }
     let len = 0;
     for (let i = 1; i < pts.length; i++) len += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
-    refined.push({ pts, closed: c.closed, len });
+    // Zincir boyunca genişlik değişimi (sivrilen şekil: yıldız ışını, köşe ucu) — sabit genişlikli stroke'a uymaz
+    const mean = cw.reduce((a, b) => a + b, 0) / cw.length;
+    let cvv = mean > 0 ? Math.sqrt(cw.reduce((a, b) => a + (b - mean) ** 2, 0) / cw.length) / mean : 1;
+    // Sivrilme: ilk ve son çeyreğin medyan genişlik oranı
+    if (cw.length >= 8) {
+      const q = Math.floor(cw.length / 4), med = (a: number[]) => { const b = [...a].sort((x, y) => x - y); return b[b.length >> 1]; };
+      const a = med(cw.slice(0, q)), b = med(cw.slice(-q));
+      if (Math.max(a, b) > 1.5 * Math.max(0.05, Math.min(a, b))) cvv = Math.max(cvv, 1);
+    }
+    refined.push({ pts, closed: c.closed, len, cv: cvv });
   }
   if (!widths.length) return null;
   widths.sort((a, b) => a - b);
@@ -210,7 +220,8 @@ export function extractStrokes(mask: Uint8Array, t: Float32Array, w: number, h: 
   let length = 0;
   for (const r of refined) {
     // Kavşak çıkıntısı (kısa kol) at; tek başına kısa parçalar (nokta/kısa çizgi) kalır
-    if (r.len < width * 1.2 && refined.length > 1) continue;
+    if (r.len < width * minLenFactor && (refined.length > 1 || minLenFactor > 1.2)) continue;
+    if (precisionOnly && (r.cv ?? 0) > 0.3) continue;
     length += r.len;
     const tol = Math.max(0.15, width * 0.12);
     if (r.closed && r.pts.length >= 6) subpaths.push(fitClosedPolygon(r.pts, tol, 50, false));
@@ -223,7 +234,7 @@ export function extractStrokes(mask: Uint8Array, t: Float32Array, w: number, h: 
   const cov = new Uint8Array(w * h);
   const rad = width / 2 + 0.75;
   for (const r of refined) {
-    if (r.len < width * 1.2 && refined.length > 1) continue;
+    if (r.len < width * minLenFactor && (refined.length > 1 || minLenFactor > 1.2)) continue;
     for (let i = 0; i < r.pts.length; i++) {
       const a = r.pts[i], b = r.pts[Math.min(r.pts.length - 1, i + 1)];
       const steps = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / 0.5));
@@ -235,8 +246,42 @@ export function extractStrokes(mask: Uint8Array, t: Float32Array, w: number, h: 
       }
     }
   }
-  let inter = 0, uni = 0;
-  for (let i = 0; i < w * h; i++) { if (mask[i] && cov[i]) inter++; if (mask[i] || cov[i]) uni++; }
-  if (uni === 0 || inter / uni < 0.6) return null;
+  let inter = 0, uni = 0, cv = 0;
+  const vm = validMask ?? mask;
+  for (let i = 0; i < w * h; i++) { if (vm[i] && cov[i]) inter++; if (vm[i] || cov[i]) uni++; if (cov[i]) cv++; }
+  // precisionOnly: stroke'lar dolgunun ÜSTÜNE eklenir → tek risk maske dışına taşmak (kesinlik ≥ %75)
+  if (precisionOnly ? cv === 0 || inter / cv < 0.75 : uni === 0 || inter / uni < 0.6) return null;
   return { subpaths, width, length };
+}
+
+/**
+ * Maskenin "ince kısımları": yerel kalınlığı (2 × pencere içindeki en büyük uzaklık dönüşümü) ≤ maxThick olan
+ * pikseller. Kalın şekle bağlanan 1 px çizgiler böyle ayrılır; kalın şeklin içi/kenarı dahil olmaz.
+ */
+export function thinParts(mask: Uint8Array, w: number, h: number, maxThick: number): Uint8Array {
+  // Chamfer 3-4 uzaklık dönüşümü (arka plana), piksel birimi ×3
+  const INF = 1 << 28, d = new Int32Array(w * h);
+  for (let i = 0; i < w * h; i++) d[i] = mask[i] ? INF : 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const p = y * w + x; if (!d[p]) continue;
+    let v = d[p];
+    if (x > 0) v = Math.min(v, d[p - 1] + 3); else v = Math.min(v, 3);
+    if (y > 0) { v = Math.min(v, d[p - w] + 3); if (x > 0) v = Math.min(v, d[p - w - 1] + 4); if (x < w - 1) v = Math.min(v, d[p - w + 1] + 4); } else v = Math.min(v, 3);
+    d[p] = v;
+  }
+  for (let y = h - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--) {
+    const p = y * w + x; if (!d[p]) continue;
+    let v = d[p];
+    if (x < w - 1) v = Math.min(v, d[p + 1] + 3); else v = Math.min(v, 3);
+    if (y < h - 1) { v = Math.min(v, d[p + w] + 3); if (x < w - 1) v = Math.min(v, d[p + w + 1] + 4); if (x > 0) v = Math.min(v, d[p + w - 1] + 4); } else v = Math.min(v, 3);
+    d[p] = v;
+  }
+  // Yerel kalınlık: pencere (r = maxThick/2 + 1) içindeki en büyük uzaklık × 2; ayrılabilir en büyük süzgeç
+  const r = Math.ceil(maxThick / 2) + 1;
+  const tmp = new Int32Array(w * h), mx = new Int32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let m = 0; for (let k = Math.max(0, x - r); k <= Math.min(w - 1, x + r); k++) if (d[y * w + k] > m) m = d[y * w + k]; tmp[y * w + x] = m; }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { let m = 0; for (let k = Math.max(0, y - r); k <= Math.min(h - 1, y + r); k++) if (tmp[k * w + x] > m) m = tmp[k * w + x]; mx[y * w + x] = m; }
+  const out = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) if (mask[i] && (2 * mx[i]) / 3 <= maxThick) out[i] = 1;
+  return out;
 }

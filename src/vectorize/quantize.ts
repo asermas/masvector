@@ -55,9 +55,9 @@ function analyzeRaw(img: Raster, alphaCut: number) {
 function seededRandom(seed: number) { return () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296); }
 
 /** Ağırlıklı k-means++ (örneklenmiş noktalar üzerinde). */
-function kmeans(pts: Lab[], wts: number[], k: number, iters = 24): { centers: Lab[]; error: number; counts: number[] } {
+function kmeans(pts: Lab[], wts: number[], k: number, iters = 24, init?: Lab[]): { centers: Lab[]; error: number; counts: number[] } {
   const rnd = seededRandom(1234 + k);
-  const centers: Lab[] = [pts[Math.floor(rnd() * pts.length)]];
+  const centers: Lab[] = init ? init.map((c) => [...c] as Lab) : [pts[Math.floor(rnd() * pts.length)]];
   const dist = pts.map((p) => d2(p, centers[0]));
   while (centers.length < k) {
     let sum = 0;
@@ -90,13 +90,67 @@ function kmeans(pts: Lab[], wts: number[], k: number, iters = 24): { centers: La
   return { centers, error: Math.sqrt(error / wsum), counts };
 }
 
+/** Düz piksellerin renk tepeleri (yeterli pay alanlar); düz piksel oranı düşükse ya da tepe sayısı maxK'yı aşarsa null. */
+function flatModes(lab: Float32Array, flat: Uint8Array, img: Raster, alphaCut: number, maxK: number): Lab[] | null {
+  const n = img.w * img.h, CELL = 0.02;
+  const cells = new Map<string, { s: [number, number, number]; c: number; i: [number, number, number] }>();
+  let flats = 0, opaque = 0;
+  for (let p = 0; p < n; p++) {
+    if (img.rgba[p * 4 + 3] < alphaCut) continue;
+    opaque++;
+    if (flat[p] !== 2) continue;
+    flats++;
+    const L = lab[p * 3], A = lab[p * 3 + 1], B = lab[p * 3 + 2];
+    const i: [number, number, number] = [Math.floor(L / CELL), Math.floor(A / CELL), Math.floor(B / CELL)];
+    const key = i.join(',');
+    let e = cells.get(key);
+    if (!e) cells.set(key, (e = { s: [0, 0, 0], c: 0, i }));
+    e.s[0] += L; e.s[1] += A; e.s[2] += B; e.c++;
+  }
+  if (!flats || flats < 0.5 * opaque) return null;
+  // Önemli hücreler (düz piksellerin ≥ %0,05'i), 26-komşulukta bağlı olanlar tek renk
+  const sig = [...cells.entries()].filter(([, e]) => e.c >= flats * 0.0005);
+  const seen = new Set<string>(), modes: { lab: Lab; c: number }[] = [];
+  const sigMap = new Map(sig);
+  for (const [key, e0] of sig) {
+    if (seen.has(key)) continue;
+    const stack = [e0]; seen.add(key);
+    const acc = [0, 0, 0]; let cnt = 0;
+    while (stack.length) {
+      const e = stack.pop()!;
+      acc[0] += e.s[0]; acc[1] += e.s[1]; acc[2] += e.s[2]; cnt += e.c;
+      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++) {
+        const k2 = `${e.i[0] + a},${e.i[1] + b},${e.i[2] + c}`;
+        const nb = sigMap.get(k2);
+        if (nb && !seen.has(k2)) { seen.add(k2); stack.push(nb); }
+      }
+    }
+    modes.push({ lab: [acc[0] / cnt, acc[1] / cnt, acc[2] / cnt], c: cnt });
+  }
+  // OKLab parlaklığı küp köklüdür: siyaha yakın tonlarda (0,0,0)/(2,2,2) ayrı hücreye düşer. sRGB'de ≤ 8 yakın
+  // tepeler tek renktir (alanla ağırlıklı birleşir)
+  modes.sort((a, b) => b.c - a.c);
+  for (let i = 0; i < modes.length; i++) for (let j = modes.length - 1; j > i; j--) {
+    const A = oklabToRgb(modes[i].lab), B = oklabToRgb(modes[j].lab);
+    if (Math.max(Math.abs(A[0] - B[0]), Math.abs(A[1] - B[1]), Math.abs(A[2] - B[2])) <= 8) {
+      const t = modes[i].c + modes[j].c;
+      modes[i].lab = [0, 1, 2].map((k) => (modes[i].lab[k] * modes[i].c + modes[j].lab[k] * modes[j].c) / t) as Lab;
+      modes[i].c = t; modes.splice(j, 1);
+    }
+  }
+  // Düz piksellerin çoğu tepelerde toplanmalı (gürültülü/gradyan görselde bu yol uygun değil)
+  const covered = modes.reduce((a, m) => a + m.c, 0);
+  if (modes.length < 1 || modes.length > maxK || covered < 0.9 * flats) return null;
+  return modes.map((m) => m.lab);
+}
+
 export interface Palette { colors: Lab[]; rgb: [number, number, number][]; k: number; error: number; tried: { k: number; error: number }[]; /** İnce yapı (çizgi/küçük metin) rengi: düz pikseli yok. */ thin?: boolean[] }
 
 /**
  * Palet çıkar. `k` verilirse tam o sayıda; yoksa 2..maxK arasında dirsek (elbow) + hedef hata ile seç.
  * `fixed` renkler (ör. kullanıcının verdiği kurumsal palet) doğrudan kullanılır.
  */
-export function extractPalette(img: Raster, o: { k?: number; maxK?: number; targetError?: number; fixed?: [number, number, number][]; alphaCut?: number } = {}): Palette {
+export function extractPalette(img: Raster, o: { k?: number; maxK?: number; targetError?: number; fixed?: [number, number, number][]; alphaCut?: number; modesMax?: number } = {}): Palette {
   const alphaCut = o.alphaCut ?? 128;
   if (o.fixed?.length) {
     const colors = o.fixed.map(([r, g, b]) => rgbToOklab(r, g, b));
@@ -117,7 +171,12 @@ export function extractPalette(img: Raster, o: { k?: number; maxK?: number; targ
   if (!pts.length) return { colors: [[1, 0, 0]], rgb: [[255, 255, 255]], k: 1, error: 0, tried: [] };
   const tried: { k: number; error: number }[] = [];
   let best: ReturnType<typeof kmeans>;
-  if (o.k) best = kmeans(pts, wts, o.k);
+  // Düz renk tepeleri: görsel çoğunlukla düz bölgelerden oluşuyorsa palet doğrudan düz piksel renklerinin
+  // histogram tepeleridir (OKLab 0,02 hücre, bağlı hücreler birleşir). Dirsek kuralı eşit büyüklükte çok renkte
+  // (64 renkli ızgara) erken durur; tepe sayımı her ayrık düz rengi bulur ve k-means taramasından hızlıdır.
+  const modes = !o.k && hasFlat ? flatModes(lab, flat, img, alphaCut, o.modesMax ?? o.maxK ?? 16) : null;
+  if (modes) best = kmeans(pts, wts, modes.length, 12, modes);
+  else if (o.k) best = kmeans(pts, wts, o.k);
   else {
     const maxK = o.maxK ?? 16, target = o.targetError ?? 0.018;
     let prev = kmeans(pts, wts, 1);
@@ -137,10 +196,11 @@ export function extractPalette(img: Raster, o: { k?: number; maxK?: number; targ
   const total = best.counts.reduce((a, b) => a + b, 0);
   let centers = best.centers.filter((_, i) => best.counts[i] / total > 0.0002);
   const merged: Lab[] = [];
-  for (const c of centers) if (!merged.some((m) => d2(m, c) < 0.0004)) merged.push(c);
+  const nearRgb = (a: Lab, b: Lab) => { const A = oklabToRgb(a), B = oklabToRgb(b); return Math.max(Math.abs(A[0] - B[0]), Math.abs(A[1] - B[1]), Math.abs(A[2] - B[2])) <= 8; };
+  for (const c of centers) if (!merged.some((m) => d2(m, c) < 0.0004 || nearRgb(m, c))) merged.push(c);
   centers = merged;
   const base = centers.length;
-  if (hasFlat && !o.k) centers.push(...thinColors(img, lab, flat, centers, alphaCut, (o.maxK ?? 16) - centers.length));
+  if (hasFlat && !o.k) centers.push(...thinColors(img, lab, flat, centers, alphaCut, Math.max(8, (o.maxK ?? 16) - centers.length)));
   return { colors: centers, rgb: centers.map(oklabToRgb), k: centers.length, error: best.error, tried, thin: centers.map((_, i) => i >= base) };
 }
 

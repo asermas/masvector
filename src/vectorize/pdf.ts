@@ -92,6 +92,34 @@ export interface PdfPageResult {
   warnings: string[];
   /** Taranmış sayfada izleme için hazır referans raster. */
   raster?: Buffer;
+  /** raster'ın sayfadaki yeri (sayfa birimi). Yoksa tüm sayfa. */
+  rasterBox?: { x: number; y: number; w: number; h: number };
+  /** raster, PDF'e gömülü görüntünün kendisi (doğal çözünürlük) mü; dpi karşılığı. */
+  nativeDpi?: number;
+}
+
+/**
+ * Taranmış sayfanın gömülü görüntüsünü DOĞAL çözünürlüğünde al: tek, eksenlere hizalı ve sayfanın ≥ %95'ini kaplayan
+ * görüntü. 300 dpi'de yeniden render etmek bilgi eklemez, yalnız enterpolasyon bulanıklığı ve 9 kat piksel ekler.
+ */
+function nativeScan(frame: Frame): { buf: Buffer; box: { x: number; y: number; w: number; h: number }; pxW: number } | null {
+  const imgs: { n: any; m: any }[] = [];
+  for (const w of walk(frame.nodes)) if (w.node.type === 'image') {
+    let m = w.node.transform;
+    for (let i = w.ancestors.length - 1; i >= 0; i--) { const a = w.ancestors[i].transform; m = { a: a.a * m.a + a.c * m.b, b: a.b * m.a + a.d * m.b, c: a.a * m.c + a.c * m.d, d: a.b * m.c + a.d * m.d, e: a.a * m.e + a.c * m.f + a.e, f: a.b * m.e + a.d * m.f + a.f }; }
+    imgs.push({ n: w.node, m });
+  }
+  if (imgs.length !== 1) return null;
+  const { n, m } = imgs[0];
+  if (Math.abs(m.b) > 1e-6 || Math.abs(m.c) > 1e-6 || m.a <= 0 || m.d <= 0) return null;
+  const box = { x: m.a * n.x + m.e, y: m.d * n.y + m.f, w: m.a * n.width, h: m.d * n.height };
+  if (box.w * box.h < 0.95 * frame.w * frame.h) return null;
+  const mm = /^data:[^;,]+;base64,(.*)$/s.exec(n.href);
+  if (!mm) return null;
+  const buf = Buffer.from(mm[1], 'base64');
+  const img = decodeImageBuffer(buf);
+  if (!img || img.width * img.height > 40e6) return null;
+  return { buf, box, pxW: img.width };
 }
 
 /** Sayfanın esasen tek bir büyük raster görsel olup olmadığını (taranmış belge) tespit et. */
@@ -134,7 +162,9 @@ export async function importPDF(file: string, o: PdfImportOptions = {}): Promise
       const res: PdfPageResult = { page, frame, kind: 'vector', warnings: imp.warnings };
       if (isScanned(frame)) {
         res.kind = 'scanned';
-        res.raster = await pdfPageToPNG(src, page, 300, tmp, o.password);
+        const nat = nativeScan(frame);
+        if (nat) { res.raster = nat.buf; res.rasterBox = nat.box; res.nativeDpi = Math.round((nat.pxW / nat.box.w) * 72); }
+        else res.raster = await pdfPageToPNG(src, page, 300, tmp, o.password);
       } else {
         if (o.cleanup !== false) res.cleanup = cleanupFrame(frame);
         const dpi = o.verifyDpi ?? 144;

@@ -7,7 +7,7 @@ import { VectorError } from '../common/errors.js';
 import { parsePathData } from '../serialization/path-data.js';
 import { transformSubPath, flattenSubPaths, segments, subpathsBBox } from '../math/bezier.js';
 import { fitClosedPolygon } from '../math/fit.js';
-import { extractStrokes } from './stroke.js';
+import { extractStrokes, thinParts } from './stroke.js';
 import { decodeImageBuffer, type DecodedImage } from '../render/png.js';
 import { coverageLabels, extractPalette, labelize, modeFilter, removeSpeckles, rgbToOklab, type Palette, type Raster } from './quantize.js';
 
@@ -54,7 +54,7 @@ export interface TraceResult {
   palette: { color: string; coverage: number; paths: number; anchors: number; gradient?: 'linear' | 'radial' }[];
   preset: TracePreset;
   scale: number;
-  stats: { anchors: number; subpaths: number; speckles: number; noise: number; blur: number; ms: number };
+  stats: { anchors: number; subpaths: number; speckles: number; noise: number; blur: number; ms: number; /** Render döngülü optimizasyon uygulandıysa. */ optimize?: { psnrBefore: number; ms: number; moves: number; splits: number } };
   warnings: string[];
 }
 
@@ -342,8 +342,9 @@ export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions =
     let pal: Palette;
     if (o.palette?.length) pal = extractPalette(img, { fixed: o.palette.map(parseHex) });
     // Çizim/gri tonlu: renk sayısı otomatik (saf siyah-beyazda dirsek 2'de durur; gri tonlu logolar tonlarını korur)
-    else if (preset === 'lineart') pal = extractPalette(img, { k: o.colors, maxK: o.maxColors ?? 8, targetError: 0.016 });
-    else pal = extractPalette(img, { k: o.colors, maxK: o.maxColors ?? (preset === 'logo' ? 16 : preset === 'illustration' ? 32 : 48), targetError: preset === 'photo' ? 0.03 : 0.016 });
+    // modesMax: düz renk baskınsa her ayrık düz renk korunur (kullanıcı maxColors verdiyse ona uyulur)
+    else if (preset === 'lineart') pal = extractPalette(img, { k: o.colors, maxK: o.maxColors ?? 8, targetError: 0.016, modesMax: o.maxColors ?? 256 });
+    else pal = extractPalette(img, { k: o.colors, maxK: o.maxColors ?? (preset === 'logo' ? 16 : preset === 'illustration' ? 32 : 48), targetError: preset === 'photo' ? 0.03 : 0.016, modesMax: o.maxColors ?? 256 });
     lab = o.labeling === 'legacy' ? labelize(img, pal) : coverageLabels({ w: W, h: H, rgba: src.rgba }, pal, w, h);
     lab = modeFilter(lab, w, h, detail > 0.8 ? 0 : 1);
     // İnce yapı renkleri (küçük metin, 1 px çizgi parçaları) leke sayılmaz
@@ -418,16 +419,27 @@ export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions =
   // Stroke çıkarımı için: rengin kaplama haritası t (0 zemin … 1 tam renk). Zemin = düz (ince olmayan) palet
   // renklerinden piksele karışım doğrusu en iyi oturan.
   const solidRgb = fills.map((f, i) => (typeof f === 'string' && !thinLabels.has(i) ? parseHex(f.slice(0, 7)) : null));
-  const strokeLayer = (ci: number, bx0: number, by0: number, cw: number, chh: number, cLab: Int16Array) => {
+  const strokeLayer = (ci: number, bx0: number, by0: number, cw: number, chh: number, cLab: Int16Array, partsOnly = false) => {
     const C = parseHex((fills[ci] as string).slice(0, 7));
-    const m = new Uint8Array(cw * chh), tm = new Float32Array(cw * chh);
+    let m: Uint8Array = new Uint8Array(cw * chh);
+    const tm = new Float32Array(cw * chh);
+    for (let q = 0; q < cw * chh; q++) m[q] = cLab[q] === ci ? 1 : 0;
+    // Düz rengin yalnız ince kısımları (kalın şekle bağlı 1–2 px çizgiler): dolgunun üstüne stroke eklenir
+    // (doğrulama tam maskeye göre: kalın kısmın üstüne düşen stroke zararsızdır; kenar payı için 1 px genişletilmiş)
+    let full: Uint8Array | undefined;
+    if (partsOnly) {
+      full = m.slice();
+      for (let y = 0; y < chh; y++) for (let x = 0; x < cw; x++) if (m[y * cw + x]) for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const xx = x + dx, yy = y + dy; if (xx >= 0 && yy >= 0 && xx < cw && yy < chh) full[yy * cw + xx] = 1; }
+      m = thinParts(m, cw, chh, 2.5 * Math.max(1, k));
+      if (!m.some((v) => v)) return null;
+    }
     for (let y = 0; y < chh; y++) for (let x = 0; x < cw; x++) {
       const q = y * cw + x, p = (y + by0) * w + x + bx0;
-      m[q] = cLab[q] === ci ? 1 : 0;
       const R = img.rgba[p * 4], G = img.rgba[p * 4 + 1], B = img.rgba[p * 4 + 2];
       let bd = Infinity, bt = 0;
-      for (const bg of solidRgb) {
-        if (!bg) continue;
+      for (let bi = 0; bi < solidRgb.length; bi++) {
+        const bg = solidRgb[bi];
+        if (!bg || bi === ci) continue;
         const v0 = C[0] - bg[0], v1 = C[1] - bg[1], v2 = C[2] - bg[2], L = v0 * v0 + v1 * v1 + v2 * v2;
         if (L < 1) continue;
         const t = Math.min(1, Math.max(0, ((R - bg[0]) * v0 + (G - bg[1]) * v1 + (B - bg[2]) * v2) / L));
@@ -452,7 +464,9 @@ export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions =
       }
       return n > 0 && dark >= 0.6 * n;
     };
-    const st = extractStrokes(m, tm, cw, chh, 3.5 * Math.max(1, k), gapOk);
+    const st = partsOnly
+      ? extractStrokes(m, tm, cw, chh, 2.5 * Math.max(1, k), () => false, 6, true, full)
+      : extractStrokes(m, tm, cw, chh, 3.5 * Math.max(1, k), gapOk);
     if (!st) return null;
     const subpaths = st.subpaths.map((sp) => transformSubPath(sp, { a: inv, b: 0, c: 0, d: inv, e: bx0 * inv, f: by0 * inv }));
     const hexC = (fills[ci] as string).slice(0, 7);
@@ -543,6 +557,11 @@ export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions =
       }), visible: true, locked: false, subpaths: sps.map((sp) => ({ ...sp, points: sp.points.map(round3) })), fillRule: 'evenodd',
     };
     layers.push(node);
+    // Düz rengin ince kısımları (aynı renkteki 1–2 px çizgiler): dış hat bunları ince/açık çizer → stroke ekle
+    if (!useGradients && !thinLabels.has(ci) && typeof fills[ci] === 'string' && !softInfo && method !== 'stacked') {
+      const tp = strokeLayer(ci, bx0, by0, cw, chh, cLab, true);
+      if (tp) { tp.node.name = `İnce çizgi ${color}`; layers.push(tp.node); anchors += tp.anchors; subpathCount += tp.node.subpaths.length; }
+    }
     palOut.push({ color, coverage: Math.round((10000 * area[ci]) / (w * h)) / 100, paths: sps.length, anchors: nA, ...(models[ci] !== 'solid' ? { gradient: models[ci] as 'linear' | 'radial' } : {}) });
   }
   if (!layers.length) warnings.push('İzlenecek içerik bulunamadı (görsel tek renk veya tamamen saydam olabilir)');
