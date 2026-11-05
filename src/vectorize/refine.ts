@@ -3,6 +3,10 @@ import type { GroupNode, PathNode, SubPath, VNode } from '../common/types.js';
 import { drawNode, type Ctx } from '../render/draw.js';
 import { multiply } from '../math/matrix.js';
 import type { Matrix } from '../common/types.js';
+import { rgbToOklab } from './quantize.js';
+
+/** Optimizasyon öncesi renkler (düğüm başına; dilimli worker'larda düğüm yeniden oluşur, sınır dilim başınadır). */
+const origColor = new WeakMap<object, { f?: [number, number, number]; s?: [number, number, number] }>();
 
 // Render döngülü geometri iyileştirme (DiffVG benzeri, türevsiz koordinat inişi):
 // izlenen şekillerin her çapası ve Bézier kolu, KAYNAK piksellere karşı yerel render hatasını düşürecek şekilde
@@ -71,7 +75,9 @@ function localLength(sp: SubPath, i: number, M: Matrix): number {
  * yalnız ince şekillerin rengi kenar yumuşatmasından kestirilir.
  */
 function meanWidth(n: PathNode, M: Matrix): number {
-  let area = 0, per = 0;
+  // Alan ağırlıklı alt yol genişliği: işaretli alan toplamı, yönleri karışık çok alt yollu bileşik şekilde (JPEG'de
+  // kalkan + leke artıkları) birbirini götürüp kalın şekli "ince" gösteriyordu → geniş mavi dolgunun rengi kayıyordu
+  let sw = 0, sa = 0;
   for (const sp of n.subpaths) {
     const pts: [number, number][] = [];
     const k = sp.points.length, segs = sp.closed ? k : k - 1;
@@ -83,11 +89,12 @@ function meanWidth(n: PathNode, M: Matrix): number {
         pts.push([w0 * c[0][0] + w1 * c[1][0] + w2 * c[2][0] + w3 * c[3][0], w0 * c[0][1] + w1 * c[1][1] + w2 * c[2][1] + w3 * c[3][1]]);
       }
     }
-    let a = 0;
+    let a = 0, per = 0;
     for (let i = 0; i < pts.length; i++) { const p = pts[i], q = pts[(i + 1) % pts.length]; a += p[0] * q[1] - q[0] * p[1]; per += Math.hypot(q[0] - p[0], q[1] - p[1]); }
-    area += a / 2; // evenodd delikler ters yönlü: işaretli toplam net alanı verir
+    const A = Math.abs(a / 2);
+    if (per > 0) { sw += A * ((2 * A) / per); sa += A; }
   }
-  return per > 0 ? (2 * Math.abs(area)) / per : 0;
+  return sa > 0 ? sw / sa : 0;
 }
 
 /** Alt yolun (kontrol noktaları dahil) yerel kutusu. */
@@ -297,11 +304,17 @@ export function refineGroup(group: GroupNode, ref: { rgba: Uint8ClampedArray; wi
         // Geniş düz dolgunun rengi kaynağın düz piksellerinden zaten kesin: yalnız ince şekillerde (ort. genişlik < 2 px)
         if (key === 'fill' && meanWidth(L.n, multiply(L.m, L.n.transform)) >= 2) continue;
         const rgb = [1, 3, 5].map((k) => parseInt(v.slice(k, k + 2), 16));
+        // Renk en çok ΔE_ok 0,25 kayabilir (paletin ince çizgi tahmini düzeltilir; siyah mürekkep zeytine,
+        // mavi kalkan bordoya dönüşmez — kayma genişlik/konum hatasını renkle telafi etmek demektir)
+        const okey = key === 'fill' ? 'f' : 's';
+        const om = origColor.get(L.n) ?? {}; if (!om[okey]) { om[okey] = rgbToOklab(rgb[0], rgb[1], rgb[2]); origColor.set(L.n, om); }
+        const o0 = om[okey]!;
+        const far = (c: number[]) => { const q = rgbToOklab(c[0], c[1], c[2]); return (q[0] - o0[0]) ** 2 + (q[1] - o0[1]) ** 2 + (q[2] - o0[2]) ** 2 > 0.25 ** 2; };
         for (const st of [16, 8, 4, 2, 1]) for (let it = 0; it < 6; it++) {
           let moved = false;
           for (let ch = 0; ch < 3; ch++) for (const sg of [1, -1]) {
             const c = [...rgb]; c[ch] = Math.max(0, Math.min(255, c[ch] + sg * st));
-            if (c[ch] === rgb[ch]) continue;
+            if (c[ch] === rgb[ch] || far(c)) continue;
             (s as any)[key] = hx(c);
             const e = winErr(...box);
             if (e < best - 1e-6) { best = e; rgb[ch] = c[ch]; moved = true; moves++; }

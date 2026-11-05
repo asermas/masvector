@@ -112,7 +112,10 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
     // (JPEG'li küçük logoda 4 temiz renk, onlarca renk bölgesinden oluşan "daha sadık" sonuçtan iyidir)
     // (yalnız AYNI kalite kademesinde: karmaşık sonuç bir üst kademeye çıkıyorsa — ör. çok iyi → mükemmel — ceza yok)
     const tier = (p: number) => (p < 0.25 ? 0 : p < 1 ? 1 : p < 3 ? 2 : 3);
-    const overfit = simple.m.pctOff <= 1.5 && tier(complex.m.pctOff) >= tier(simple.m.pctOff) && complex.r.stats.anchors >= 3 * Math.max(1, simple.r.stats.anchors);
+    // Kayıplı kaynakta kademe istisnası yok: gürültüsü giderilmiş referans bile blok/çınlama izi taşır; çok bölgeli
+    // gradyan sonucu bu izi "doğru" çizerek ölçütte kademe atlar ama gerçek şekilden uzaklaşır (bayrak JPEG'inde
+    // %0,43 düz renk ≈ gerçek şekle %0, %0,12 gradyan ≈ gerçek şekle %1,2)
+    const overfit = simple.m.pctOff <= 1.5 && (o.lossySource || tier(complex.m.pctOff) >= tier(simple.m.pctOff)) && complex.r.stats.anchors >= 3 * Math.max(1, simple.r.stats.anchors);
     const complexWins = !overfit && complex.m.pctOff < simple.m.pctOff * 0.6 && simple.m.pctOff - complex.m.pctOff > 0.3;
     const better = (complexWins ? complex : simple) === alt;
     if (better) best = alt;
@@ -208,8 +211,8 @@ async function optimizeResult(r: TraceResult, m0: CompareMetrics & { reference: 
   };
   if (!r.group.children.some((c) => c.type === 'path')) return null;
   const group = structuredClone(r.group);
-  // Bütçe: çapa sayısıyla ölçeklenir (küçük görselde birkaç yüz ms; büyükte en çok 8 s)
-  const budget = budgetMs ?? Math.min(8000, 1500 + r.stats.anchors * 6);
+  // Bütçe: çapa sayısıyla ölçeklenir (küçük görselde birkaç yüz ms; karmaşık armada en çok 30 s — doğruluk önce)
+  const budget = budgetMs ?? Math.min(30000, 1500 + r.stats.anchors * 12);
   const rep = await refineGroupIsolated(group, ref, r.background, { budgetMs: budget });
   let m1 = measure(group);
   const ok = (a: typeof m0, b: typeof m0) => a.pctOff <= b.pctOff + 1e-9 && a.psnr > b.psnr + 0.05;

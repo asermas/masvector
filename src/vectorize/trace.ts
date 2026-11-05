@@ -9,6 +9,7 @@ import { transformSubPath, flattenSubPaths, segments, subpathsBBox } from '../ma
 import { fitClosedPolygon } from '../math/fit.js';
 import { extractStrokes, thinParts } from './stroke.js';
 import { decodeImageBuffer, type DecodedImage } from '../render/png.js';
+import { cleanReference } from './compare.js';
 import { coverageLabels, triMix, extractPalette, labelize, modeFilter, removeSpeckles, rgbToOklab, type Palette, type Raster } from './quantize.js';
 
 // Raster → vektör izleme hattı:
@@ -45,6 +46,8 @@ export interface TraceOptions {
   labeling?: 'coverage' | 'legacy';
   /** (Gelişmiş) Küçük görsellerde gradyan segmentasyonunun büyütme ölçeği (varsayılan 1 = kaynak çözünürlüğü). */
   segScale?: number;
+  /** Kaynak kayıplı sıkıştırılmış (JPEG): palet/etiketleme gürültüsü giderilmiş görüntüde yapılır. */
+  lossySource?: boolean;
 }
 
 export interface TraceResult {
@@ -218,8 +221,19 @@ async function traceMask(mask: Uint8Array, W: number, H: number, cfg: { speckle:
 
 export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions = {}): Promise<TraceResult> {
   const t0 = Date.now();
-  const src = Buffer.isBuffer(input) ? decodeImageBuffer(input) : input;
+  let src = Buffer.isBuffer(input) ? decodeImageBuffer(input) : input;
   if (!src) throw new VectorError('INVALID_ARGUMENT', 'Görsel çözülemedi (desteklenen: PNG, JPEG, WebP, GIF, BMP, TIFF)');
+  // Kayıplı kaynak (JPEG): blok/çınlama gürültüsü düz renkleri "düz değil" gösterir, palet gürültü tonlarıyla dolar ve
+  // ince sarı/mavi şeritler ayrı ince renklere bölünür. Ölçütün kullandığı kenar koruyan temizlikle aynı görüntüde çalış.
+  if (o.lossySource && Math.min(src.width, src.height) >= 64) {
+    const pr = { w: src.width, h: src.height, rgba: src.rgba };
+    const cl = cleanReference(src.rgba, src.width, src.height, estimateNoise(pr), true);
+    const cv = createCanvas(src.width, src.height);
+    const id = cv.getContext('2d').createImageData(src.width, src.height);
+    id.data.set(cl);
+    cv.getContext('2d').putImageData(id, 0, 0);
+    src = { width: src.width, height: src.height, rgba: cl, canvas: cv };
+  }
   const warnings: string[] = [];
   const W = src.width, H = src.height;
   if (W * H > 60e6) throw new VectorError('INVALID_ARGUMENT', `Görsel çok büyük (${W}×${H}); en çok 60 MP`);
