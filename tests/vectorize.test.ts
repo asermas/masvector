@@ -121,7 +121,7 @@ describe('raster izleme', () => {
     expect(q.report.fidelity!.pctOff).toBeLessThan(0.5);
     const s = await vectorizeImageToDoc(readFileSync(path.join(FX, 'logo-small.jpg')));
     expect(s.report.fidelity!.pctOff).toBeLessThan(1.5);
-    const ring = vectorPaths(s.doc).find((p) => /^#d[89]/.test(String(p.style.fill)))!;
+    const ring = vectorPaths(s.doc).find((p) => /^#d[89a]/.test(String(p.style.fill)))!;
     // Halka deliği: ya korunur ya da (anlamsal şekiller) üstteki şekillerce tamamen örtülüyse kapatılır — görünüm aynı
     expect(ring.subpaths.length).toBeLessThanOrEqual(2);
   }, 90_000);
