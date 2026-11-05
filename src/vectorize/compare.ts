@@ -42,6 +42,14 @@ function flatten(px: Uint8ClampedArray): Uint8ClampedArray {
 }
 
 const clamp8 = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
+// OKLab L siyaha yakın algısal olarak tekdüze değil (#010101 ile #000000 arası ΔL≈0.067 > eşik, ama gözle ayırt edilemez).
+// Ottosson'un "toe" düzeltmesi (Lr; CIELAB L* gibi koyu tonlarda doğrusal) ile ölçülür.
+const K1 = 0.206, K2 = 0.03, K3 = (1 + K1) / (1 + K2);
+function labT(r: number, g: number, b: number): [number, number, number] {
+  const c = rgbToOklab(r, g, b), L = c[0], u = K3 * L - K1;
+  // K3'e bölünür: açık tonlarda eğim 1 kalır (ölçüt yalnız koyu tonlarda gevşer, açıklarda sıkılaşmaz)
+  return [(u + Math.sqrt(u * u + 4 * K2 * K3 * L)) / 2 / K3, c[1], c[2]];
+}
 
 export function compareRGBA(ref: Uint8ClampedArray, out: Uint8ClampedArray, w: number, h: number): { metrics: CompareMetrics; diffMask: Uint8Array } {
   const A = flatten(ref), B = flatten(out);
@@ -50,7 +58,7 @@ export function compareRGBA(ref: Uint8ClampedArray, out: Uint8ClampedArray, w: n
   const diffMask = new Uint8Array(n);
   const toLab = (X: Uint8ClampedArray) => {
     const o = new Float32Array(n * 3);
-    for (let p = 0; p < n; p++) { const c = rgbToOklab(X[p * 3], X[p * 3 + 1], X[p * 3 + 2]); o[p * 3] = c[0]; o[p * 3 + 1] = c[1]; o[p * 3 + 2] = c[2]; }
+    for (let p = 0; p < n; p++) { const c = labT(X[p * 3], X[p * 3 + 1], X[p * 3 + 2]); o[p * 3] = c[0]; o[p * 3 + 1] = c[1]; o[p * 3 + 2] = c[2]; }
     return o;
   };
   const LA = toLab(A), LB = toLab(B);
@@ -86,7 +94,7 @@ export function compareRGBA(ref: Uint8ClampedArray, out: Uint8ClampedArray, w: n
           const vv = vx * vx + vy * vy + vz * vz;
           if (vv < 1) continue;
           const t = Math.max(-0.15, Math.min(1.15, ((PS[i] - QS[qa]) * vx + (PS[i + 1] - QS[qa + 1]) * vy + (PS[i + 2] - QS[qa + 2]) * vz) / vv));
-          const c = rgbToOklab(clamp8(QS[qa] + t * vx), clamp8(QS[qa + 1] + t * vy), clamp8(QS[qa + 2] + t * vz));
+          const c = labT(clamp8(QS[qa] + t * vx), clamp8(QS[qa + 1] + t * vy), clamp8(QS[qa + 2] + t * vz));
           const dd = Math.sqrt((PL[i] - c[0]) ** 2 + (PL[i + 1] - c[1]) ** 2 + (PL[i + 2] - c[2]) ** 2);
           if (dd < bestD) bestD = dd;
         }

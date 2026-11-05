@@ -105,10 +105,12 @@ describe('raster izleme', () => {
     const tri = paths.find((p) => p.style.fill === '#f3a619')!;
     expect(tri.subpaths).toHaveLength(1);
     expect(tri.subpaths[0].points.length).toBeLessThanOrEqual(4);
-    const navy = paths.find((p) => p.style.fill === '#193373')!;
-    expect(navy.subpaths.length).toBeGreaterThanOrEqual(10); // dikdörtgen + harfler + delikler + noktalar
-    const red = paths.find((p) => p.style.fill === '#d91933')!;
-    expect(red.subpaths).toHaveLength(2); // yalnız halka (dış + delik) — üst katmanların gizli kopyası yok
+    // Anlamsal şekiller: renk katmanı nesnelere ayrılır (dikdörtgen + harfler + noktalar ayrı şekiller)
+    const navy = leaves(r.doc).filter((n) => n.style.fill === '#193373');
+    expect(navy.reduce((s, n) => s + (n.type === 'path' ? n.subpaths.length : 1), 0)).toBeGreaterThanOrEqual(10);
+    const red = paths.filter((p) => p.style.fill === '#d91933');
+    expect(red).toHaveLength(1);
+    expect(red[0].subpaths).toHaveLength(2); // yalnız halka (dış + delik) — üst katmanların gizli kopyası yok
     expect(r.doc.pages[0].frames[0].background).toBe('#ffffff');
     const refLayer = r.doc.pages[0].frames[0].nodes[0] as any;
     expect(refLayer.locked && !refLayer.visible && refLayer.children[0].type === 'image').toBe(true);

@@ -6,8 +6,9 @@ import { createDocument } from '../model/scene.js';
 import { decodeImageBuffer, type DecodedImage } from '../render/png.js';
 import { rgbaToDataUri } from '../render/image-ops.js';
 import { traceImage, type TraceOptions, type TraceResult } from './trace.js';
-import { exactColorCount, neighborDiff, pixelEdgeDensity, pixelTrace } from './pixel.js';
+import { blockScale, exactColorCount, neighborDiff, pixelEdgeDensity, pixelTrace } from './pixel.js';
 import { cleanReference, compareDocument, type CompareMetrics } from './compare.js';
+import { semanticShapes } from './semantic.js';
 import { refineGroupIsolated } from './refine.js';
 import { importPDF, type PdfImportOptions } from './pdf.js';
 
@@ -27,6 +28,8 @@ export interface VectorizeImageOptions extends TraceOptions {
    * süre bütçesi (ms). Varsayılan: açık, bütçe çapa sayısına göre (≤ 8 s).
    */
   optimize?: boolean | number;
+  /** Anlamsal şekiller: renk katmanlarını nesnelere ayır, örtülü kısmı tamamlanabilenleri dikdörtgen/elipse çevir (varsayılan true). */
+  semantic?: boolean;
   /** Kaynak kayıplı sıkıştırılmış (JPEG/kayıplı WebP): ölçüt gürültüsü giderilmiş kaynağa karşı yapılır. */
   lossySource?: boolean;
   /** Kaynak görseli kilitli+gizli "Referans" katmanı olarak ekle (varsayılan true). */
@@ -79,7 +82,10 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
     const m = pixel ? { ...compareDocument(doc, { rgba: img.rgba, width: img.width, height: img.height }).metrics, reference: 'kaynak' as const } : { ...compareDocument(doc, ref, { chroma: !!o.lossySource }).metrics, reference: refKind };
     return finish(r, m, opts);
   };
+  // Tüm pürüzsüz denemeler (optimizasyon için yedek adaylar)
+  const pool: { r: TraceResult; m: any }[] = [];
   const finish = (r: TraceResult, m: any, opts: TraceOptions) => {
+    if (r.group.name?.startsWith('Vektör izleme')) pool.push({ r, m });
     attempts.push({ options: { colors: opts.colors, detail: opts.detail, maxColors: opts.maxColors, smoothness: opts.smoothness, gradients: opts.gradients, ...(opts.segScale ? { segScale: opts.segScale } : {}), ...((opts as VectorizeImageOptions).optimize ? { optimize: true } : {}) } as Partial<VectorizeImageOptions>, pctOff: m.pctOff, anchors: r.stats.anchors });
     return { r, m };
   };
@@ -137,7 +143,33 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
   // Render döngülü optimizasyon (piksel-birebir yedeklerinden ÖNCE: optimize edilmiş pürüzsüz sonuç onlarla yarışır)
   if (o.optimize !== false && o.refine !== false && best.m.pctOff > 0) {
     const opt = await optimizeResult(best.r, best.m, ref!, typeof o.optimize === 'number' ? o.optimize : undefined, !!o.lossySource, refKind);
+    const base = best;
     if (opt) best = finish(opt.r, opt.m, { ...o, optimize: true } as VectorizeImageOptions);
+    // Hâlâ hedefin üstündeyse (küçük görsel): diğer en iyi 2 aday da optimize edilir — en iyi izleme her zaman
+    // en iyi optimize edilmiş sonucu vermez (sivri köşeli kaba izleme alt pikselde daha iyi oturabilir)
+    if (best.m.pctOff > 0.5 && img.width * img.height <= 262_144) {
+      // Karmaşıklık cezası burada da: kat kat fazla çapalı aday (JPEG gürültüsünü bölge bölge izleyen) seçilmez
+      const others = pool.filter((c) => c !== base && c.r !== best.r && !(best.m.pctOff <= 1.5 && c.r.stats.anchors >= 3 * Math.max(1, base.r.stats.anchors)))
+        .sort((a, b) => a.m.pctOff - b.m.pctOff).slice(0, 2);
+      for (const c of others) {
+        const o2 = await optimizeResult(c.r, c.m, ref!, typeof o.optimize === 'number' ? o.optimize : undefined, !!o.lossySource, refKind);
+        if (o2 && o2.m.pctOff < best.m.pctOff) best = finish(o2.r, o2.m, { ...o, optimize: true } as VectorizeImageOptions);
+        if (best.m.pctOff <= 0.5) break;
+      }
+    }
+  }
+  // Anlamsal şekiller: renk katmanları nesnelere ayrılır, örtülü kısmı tamamlanabilen şekiller dikdörtgen/elips olur.
+  // Görsel sonuç değişmemeli: ölçüt ancak ihmal edilebilir (≤ 0.02 puan) kötüleşirse kabul.
+  if (o.semantic !== false && best.r.group.children.some((c) => c.type === 'path')) {
+    const sem = semanticShapes(best.r.group, best.r.width, best.r.height);
+    const doc = createDocument('t', best.r.width, best.r.height);
+    const f = doc.pages[0].frames[0];
+    f.background = best.r.background ?? 'none';
+    f.nodes = [sem.group];
+    const m = { ...compareDocument(doc, ref!, { chroma: !!o.lossySource }).metrics, reference: refKind };
+    if (m.pctOff <= best.m.pctOff + 0.02) {
+      best = { r: { ...best.r, group: sem.group, stats: { ...best.r.stats, semantic: sem.report } }, m };
+    }
   }
   // Sert kenarlı piksel grafiği (az sayıda TAM renk) ya da çok küçük görsel ve pürüzsüz izleme zayıfsa:
   // piksel-birebir vektör (piksel sanatı, 1-bit titreşimli, 1 px desen, 16–64 px ikonlar)
@@ -148,7 +180,11 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
     const exact = exactColorCount(img, tiny ? 4096 : 64);
     // Son çare: hiçbir pürüzsüz yorum tutmuyorsa (>%5 hata; ör. saf gürültü, doku) ve görsel ≤ 512² ise piksel-birebir
     const hopeless = best.m.pctOff > 5 && n <= 262_144;
-    if (exact <= 64 || (tiny && exact <= 4096) || hopeless) {
+    // Kenar yumuşatmasız çizim (ör. 4 bit paletli bayrak, eski GIF logo): büyük, piksel ızgarasına oturan blok yapısı
+    // yok — merdiven kenarlar pürüzsüz eğrinin örneklenmesidir. Burada piksel kareleri "vektör" değildir: pürüzsüz
+    // sonuç makulse (≤ %3) korunur. Gerçek piksel sanatı (tamsayı katı büyütülmüş bloklar) ya da küçük ikon değişmez.
+    const aliasedArt = !tiny && Math.min(img.width, img.height) >= 96 && blockScale(img) < 2 && best.m.pctOff <= 3;
+    if (!aliasedArt && (exact <= 64 || (tiny && exact <= 4096) || hopeless)) {
       const c = await evaluate({ ...o }, true);
       if (c.m.pctOff < best.m.pctOff * 0.5) best = c;
     }

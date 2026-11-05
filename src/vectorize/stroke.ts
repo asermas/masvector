@@ -193,8 +193,19 @@ export function extractStrokes(mask: Uint8Array, t: Float32Array, w: number, h: 
       const L = Math.hypot(dx, dy) || 1; dx /= L; dy /= L;
       const nx = -dy, ny = dx;
       // Normal boyunca kaplama kesiti: ağırlık merkezi (konum) + toplam (genişlik)
+      // Yalnız bu çizginin kesiti: merkezden iki yana, kaplama sönene (ya da bir vadiden sonra yeniden yükselene —
+      // komşu çizgi) kadar. Sabit pencere yoğun ince çizimde (arma, harita) komşu konturları da toplar.
       let s0 = 0, s1 = 0;
-      for (let s = -R; s <= R; s += 0.25) { const v = sampleT(t, w, h, c.pts[i].x + nx * s, c.pts[i].y + ny * s); s0 += v; s1 += v * s; }
+      const v0 = sampleT(t, w, h, c.pts[i].x, c.pts[i].y);
+      s0 += v0;
+      for (const sg of [1, -1]) {
+        let prev = v0, minV = v0;
+        for (let s = 0.25; s <= R; s += 0.25) {
+          const v = sampleT(t, w, h, c.pts[i].x + nx * s * sg, c.pts[i].y + ny * s * sg);
+          if (v < 0.02 || (v > minV + 0.08 && v > prev)) break;
+          s0 += v; s1 += v * s * sg; prev = v; if (v < minV) minV = v;
+        }
+      }
       const off = s0 > 1e-6 ? Math.max(-1.5, Math.min(1.5, s1 / s0)) : 0;
       widths.push(s0 * 0.25); cw.push(s0 * 0.25);
       pts.push({ x: c.pts[i].x + nx * off, y: c.pts[i].y + ny * off });
@@ -246,9 +257,15 @@ export function extractStrokes(mask: Uint8Array, t: Float32Array, w: number, h: 
       }
     }
   }
-  let inter = 0, uni = 0, cv = 0;
+  let inter = 0, uni = 0, cv = 0, mA = 0, cvIn = 0;
   const vm = validMask ?? mask;
-  for (let i = 0; i < w * h; i++) { if (vm[i] && cov[i]) inter++; if (vm[i] || cov[i]) uni++; if (cov[i]) cv++; }
+  // Kesinlik için maske 1 px genişletilir: ince (piksel altı) çizginin etiket maskesi stroke'un kendi kenar payından darsa
+  // IoU düşer ama stroke doğrudur
+  const vmD = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (vm[y * w + x]) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const xx = x + dx, yy = y + dy; if (xx >= 0 && yy >= 0 && xx < w && yy < h) vmD[yy * w + xx] = 1; }
+  for (let i = 0; i < w * h; i++) { if (vm[i] && cov[i]) inter++; if (vm[i] || cov[i]) uni++; if (cov[i]) { cv++; if (vmD[i]) cvIn++; } if (vm[i]) mA++; }
+  // İnce (≤ 2,5 px) çizgide IoU yerine: maskenin ≥ %85'i örtülü ve stroke'un ≥ %70'i (1 px genişletilmiş) maskede
+  if (!precisionOnly && width <= 2.5 * Math.max(1, maxWidth / 3.5) && mA > 0 && cv > 0 && inter / mA >= 0.85 && cvIn / cv >= 0.7) return { subpaths, width, length };
   // precisionOnly: stroke'lar dolgunun ÜSTÜNE eklenir → tek risk maske dışına taşmak (kesinlik ≥ %75)
   if (precisionOnly ? cv === 0 || inter / cv < 0.75 : uni === 0 || inter / uni < 0.6) return null;
   return { subpaths, width, length };

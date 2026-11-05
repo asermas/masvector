@@ -122,3 +122,25 @@ export function pixelTrace(img: DecodedImage): TraceResult {
     warnings: ['Sert kenarlı piksel grafiği (piksel sanatı / titreşimli / çok küçük görsel): piksel-birebir vektör üretildi. Pürüzsüz (yumuşatılmış) yorum için refine: false kullanın.'],
   };
 }
+
+/**
+ * Piksel sanatının büyütme katı: yatay/dikey tek renk koşularının (≥ %90'ı) bölündüğü en büyük s ∈ [2, 16].
+ * Büyütülmüş piksel sanatı s ≥ 2 verir; kenar yumuşatmasız çizim (merdiven kenarlı eğri) ve doğal piksel sanatı 1.
+ */
+export function blockScale(img: DecodedImage): number {
+  const { width: W, height: H, rgba } = img;
+  const runs: number[] = [];
+  const same = (p: number, q: number) => rgba[p * 4] === rgba[q * 4] && rgba[p * 4 + 1] === rgba[q * 4 + 1] && rgba[p * 4 + 2] === rgba[q * 4 + 2] && rgba[p * 4 + 3] === rgba[q * 4 + 3];
+  const rowStep = Math.max(1, Math.floor(H / 200)), colStep = Math.max(1, Math.floor(W / 200));
+  for (let y = 0; y < H; y += rowStep) {
+    let start = 0;
+    for (let x = 1; x <= W; x++) if (x === W || !same(y * W + x, y * W + x - 1)) { if (start > 0 && x < W) runs.push(x - start); start = x; }
+  }
+  for (let x = 0; x < W; x += colStep) {
+    let start = 0;
+    for (let y = 1; y <= H; y++) if (y === H || !same(y * W + x, (y - 1) * W + x)) { if (start > 0 && y < H) runs.push(y - start); start = y; }
+  }
+  if (runs.length < 20) return 1;
+  for (let s = 16; s >= 2; s--) if (runs.filter((r) => r % s === 0).length >= 0.9 * runs.length) return s;
+  return 1;
+}

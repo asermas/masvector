@@ -9,7 +9,7 @@ import { transformSubPath, flattenSubPaths, segments, subpathsBBox } from '../ma
 import { fitClosedPolygon } from '../math/fit.js';
 import { extractStrokes, thinParts } from './stroke.js';
 import { decodeImageBuffer, type DecodedImage } from '../render/png.js';
-import { coverageLabels, extractPalette, labelize, modeFilter, removeSpeckles, rgbToOklab, type Palette, type Raster } from './quantize.js';
+import { coverageLabels, triMix, extractPalette, labelize, modeFilter, removeSpeckles, rgbToOklab, type Palette, type Raster } from './quantize.js';
 
 // Raster → vektör izleme hattı:
 //  1) çöz + gerekirse büyüt (küçük görsellerde pürüzsüz kenar için)
@@ -54,7 +54,7 @@ export interface TraceResult {
   palette: { color: string; coverage: number; paths: number; anchors: number; gradient?: 'linear' | 'radial' }[];
   preset: TracePreset;
   scale: number;
-  stats: { anchors: number; subpaths: number; speckles: number; noise: number; blur: number; ms: number; /** Render döngülü optimizasyon uygulandıysa. */ optimize?: { psnrBefore: number; ms: number; moves: number; splits: number } };
+  stats: { anchors: number; subpaths: number; speckles: number; noise: number; blur: number; ms: number; /** Render döngülü optimizasyon uygulandıysa. */ optimize?: { psnrBefore: number; ms: number; moves: number; splits: number }; /** Anlamsal şekil dönüşümü. */ semantic?: import('./semantic.js').SemanticReport };
   warnings: string[];
 }
 
@@ -446,8 +446,19 @@ export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions =
         const dd = (R - bg[0] - t * v0) ** 2 + (G - bg[1] - t * v1) ** 2 + (B - bg[2] - t * v2) ** 2;
         if (dd < bd) { bd = dd; bt = t; }
       }
+      // İki zemin + çizgi karışımı (kenar üstündeki kontur: kırmızı/sarı sınırında siyah çizgi): üçgen karışımı
+      if (bd >= 45 * 45 && !partsOnly) {
+        for (let i = 0; i < solidRgb.length; i++) { const A = solidRgb[i]; if (!A || i === ci) continue;
+          for (let j = i + 1; j < solidRgb.length; j++) { const Bc = solidRgb[j]; if (!Bc || j === ci) continue;
+            const r = triMix([R, G, B], A, Bc, C);
+            if (r.dist * r.dist < bd) { bd = r.dist * r.dist; bt = r.t; }
+          } }
+      }
       tm[q] = bd < 45 * 45 ? bt : m[q];
     }
+    // İnce yapı rengi: çizgi maskesi etiketten değil kaplamadan (piksel altı çizgi hiçbir pikseli yarıdan çok örtmeyebilir;
+    // etiket maskesi kesik kesik kalır, sırt hattı kaybolur)
+    if (!partsOnly) for (let q = 0; q < cw * chh; q++) if (tm[q] >= 0.22 && (cLab[q] < 0 || !thinLabels.has(cLab[q]) || cLab[q] === ci)) m[q] = 1;
     // Köprü yalnız boşluktaki kaynak pikseller zeminden belirgin farklıysa (kesişim karışımı); harf aralığı zemindir
     const gapOk = (a: { x: number; y: number }, b: { x: number; y: number }) => {
       let dark = 0, n = 0;

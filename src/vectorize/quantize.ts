@@ -242,20 +242,20 @@ function extrapolate(c: Lab, centers: Lab[]): Lab {
 function thinColors(img: Raster, lab: Float32Array, flat: Uint8Array, centers: Lab[], alphaCut: number, room: number): Lab[] {
   if (room <= 0 || !centers.length) return [];
   const n = img.w * img.h, step = Math.max(1, Math.floor(n / 150_000));
-  const pts: Lab[] = [], far: number[] = [];
+  const pts: Lab[] = [], far: number[] = [], bases: number[] = [], rgbs: [number, number, number][] = [];
   const W = img.w, H = img.h;
   const nearestC = (q: number) => { let bd = Infinity, bi = 0; for (let i = 0; i < centers.length; i++) { const c = centers[i]; const dd = (lab[q * 3] - c[0]) ** 2 + (lab[q * 3 + 1] - c[1]) ** 2 + (lab[q * 3 + 2] - c[2]) ** 2; if (dd < bd) { bd = dd; bi = i; } } return bi; };
   // Çizgi mi, kenar artığı mı: bir eksen boyunca iki yandaki ilk düz pikseller AYNI renkteyse çizgi (zemin üstünde
   // ince yapı); farklıysa iki bölgenin sınırındaki JPEG çınlaması / yumuşatma kalıntısıdır → palet rengi değildir.
-  const lineLike = (p: number) => {
+  const lineLike = (p: number): number => {
     const x = p % W, y = (p / W) | 0;
     for (const [dx, dy] of [[1, 0], [0, 1], [1, 1], [1, -1]]) {
       let a = -1, b = -1;
       for (let d = 1; d <= 10 && a < 0; d++) { const xx = x + dx * d, yy = y + dy * d; if (xx < 0 || yy < 0 || xx >= W || yy >= H) break; const q = yy * W + xx; if (flat[q] === 2) a = nearestC(q); }
       for (let d = 1; d <= 10 && b < 0; d++) { const xx = x - dx * d, yy = y - dy * d; if (xx < 0 || yy < 0 || xx >= W || yy >= H) break; const q = yy * W + xx; if (flat[q] === 2) b = nearestC(q); }
-      if (a >= 0 && a === b) return true;
+      if (a >= 0 && a === b) return a;
     }
-    return false;
+    return -1;
   };
   let opaque = 0;
   for (let p = 0; p < n; p += step) {
@@ -264,10 +264,28 @@ function thinColors(img: Raster, lab: Float32Array, flat: Uint8Array, centers: L
     if (flat[p] === 2) continue;
     const c: Lab = [lab[p * 3], lab[p * 3 + 1], lab[p * 3 + 2]];
     const u = unexplained(c, centers);
-    if (u > 0.05 ** 2 && lineLike(p)) { pts.push(c); far.push(u); }
+    if (u > 0.05 ** 2) { const b = lineLike(p); if (b >= 0) { pts.push(c); far.push(u); bases.push(b); rgbs.push([img.rgba[p * 4], img.rgba[p * 4 + 1], img.rgba[p * 4 + 2]]); } }
   }
   // Gürültü değil yapı: açıklanamayan pikseller opak alanın en az ‰1'i
   if (pts.length < Math.max(12, opaque * 0.001)) return [];
+  // Ortak mürekkep: piksel altı ince kontur (ör. 0,5 px siyah çizgi) hiç tam kaplanmaz; farklı zeminler üstündeki
+  // pikselleri zemin→mürekkep karışım doğruları üzerindedir ve bu doğrular (sRGB'de) mürekkep renginde kesişir.
+  // Doğrulara en yakın nokta (en küçük kareler) çoğu pikseli açıklıyorsa o renk ince yapı rengidir — gözlenen hiçbir
+  // pikselde tam görünmese de.
+  const out0: Lab[] = [];
+  const ink = commonInk(rgbs, bases.map((b) => oklabToRgb(centers[b])), new Set(bases).size, centers.map(oklabToRgb));
+  if (ink) {
+    const X = rgbToOklab(ink[0], ink[1], ink[2]);
+    if (!centers.some((q) => d2(q, X) < 0.2 ** 2)) {
+      out0.push(X);
+      // Mürekkeple açıklananlar kümelemeden çıkar
+      // (iki zemin + mürekkep karışımları dahil: kırmızı-beyaz sınırındaki siyah kontur grisi ayrı renk değildir)
+      const crgb = centers.map(oklabToRgb);
+      const inkMix = (P: number[]) => { for (let a = 0; a < crgb.length; a++) for (let b = a; b < crgb.length; b++) if (triMix(P, crgb[a], crgb[b], ink).dist <= 12) return true; return false; };
+      for (let i = pts.length - 1; i >= 0; i--) if (unexplained(pts[i], [...centers, X]) <= 0.05 ** 2 || inkMix(rgbs[i])) { pts.splice(i, 1); far.splice(i, 1); rgbs.splice(i, 1); }
+      if (pts.length < Math.max(12, opaque * 0.001)) return out0;
+    }
+  }
   const wts = pts.map(() => 1);
   let prevErr = Infinity;
   let km = kmeans(pts, wts, 1);
@@ -295,12 +313,64 @@ function thinColors(img: Raster, lab: Float32Array, flat: Uint8Array, centers: L
     cands.push({ col: extrapolate(col, centers), u: unexplained(col, centers) });
   }
   // En uç renkler önce: ardından gelen ara tonlar (ör. kırmızı çizginin pembe yumuşatması) yeni renkle açıklanıyorsa eklenmez
-  const out: Lab[] = [];
+  const out: Lab[] = [...out0];
   // Mevcut bir palet rengine çok yakınsa (ör. #0a0a0a metin + çınlamayla dışdeğerlenmiş #000) ayrı renk değildir:
   // aynı şekil iki etikete benek benek bölünür
   const tooClose = (c: Lab) => [...centers, ...out].some((q) => d2(q, c) < 0.2 ** 2);
   for (const c of cands.sort((a, b) => b.u - a.u)) if (unexplained(c.col, [...centers, ...out]) > 0.05 ** 2 && !tooClose(c.col)) out.push(c.col);
   return out;
+}
+
+/**
+ * Zemin→piksel doğrularının (sRGB) en küçük kareler kesişimi. En az iki farklı zemin, gamut içi çözüm ve piksellerin
+ * çoğunun (≥ %60) doğruya yakın (karışım oranı 0..1) olması gerekir.
+ */
+function commonInk(px: [number, number, number][], bg: [number, number, number][], nBases: number, pal: [number, number, number][] = []): [number, number, number] | null {
+  if (nBases < 2 || px.length < 12) return null;
+  const A = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], v = [0, 0, 0];
+  const dirs: number[][] = [];
+  for (let i = 0; i < px.length; i++) {
+    let d = [px[i][0] - bg[i][0], px[i][1] - bg[i][1], px[i][2] - bg[i][2]];
+    const L = Math.hypot(d[0], d[1], d[2]);
+    if (L < 12) { dirs.push([]); continue; }
+    d = d.map((x) => x / L); dirs.push(d);
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) { const m = (r === c ? 1 : 0) - d[r] * d[c]; A[r][c] += m; v[r] += m * bg[i][c]; }
+  }
+  const det = (M: number[][]) => M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0]) + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+  // Destek: piksel, zemin→X doğru parçasına ≤ 10 (sRGB) uzaklıkta; destekleyen zemin sayısı da sayılır
+  // Kenar üstündeki çizgi: piksel iki zemin + mürekkep karışımı olabilir (kırmızı üstünde sarı kale + siyah kontur):
+  // zemin rengi ile herhangi bir palet rengi ve X'in oluşturduğu üçgene uzaklık
+  const tri = (P: number[], A: number[], B: number[], X: number[]) => {
+    // P ≈ A + u (B − A) + t (X − A), u,t ≥ 0, u + t ≤ 1 — 2×2 en küçük kareler, sınırda kırpılır
+    const e1 = [B[0] - A[0], B[1] - A[1], B[2] - A[2]], e2 = [X[0] - A[0], X[1] - A[1], X[2] - A[2]], d = [P[0] - A[0], P[1] - A[1], P[2] - A[2]];
+    const a11 = e1[0] ** 2 + e1[1] ** 2 + e1[2] ** 2, a22 = e2[0] ** 2 + e2[1] ** 2 + e2[2] ** 2, a12 = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
+    const b1 = d[0] * e1[0] + d[1] * e1[1] + d[2] * e1[2], b2 = d[0] * e2[0] + d[1] * e2[1] + d[2] * e2[2];
+    const det = a11 * a22 - a12 * a12;
+    let u = 0, t = a22 > 1e-9 ? b2 / a22 : 0;
+    if (det > 1e-6) { u = (b1 * a22 - b2 * a12) / det; t = (a11 * b2 - a12 * b1) / det; }
+    u = Math.max(0, Math.min(1, u)); t = Math.max(0, Math.min(1 - u, t));
+    return { dist: Math.hypot(d[0] - u * e1[0] - t * e2[0], d[1] - u * e1[1] - t * e2[1], d[2] - u * e1[2] - t * e2[2]), t };
+  };
+  const support = (Xc: number[]) => {
+    let ok = 0; const bs = new Set<string>();
+    for (let i = 0; i < px.length; i++) {
+      const B = bg[i];
+      let hit = false;
+      for (const C of pal.length ? pal : [B]) { const r = tri(px[i], B, C, Xc); if (r.t > 0.08 && r.dist <= 10) { hit = true; break; } }
+      if (hit) { ok++; bs.add(B.join()); }
+    }
+    return { ok, bases: bs.size };
+  };
+  // Adaylar: en küçük kareler kesişimi + saf siyah/beyaz (en yaygın kontur mürekkepleri); en çok destekleyen seçilir
+  const cands: number[][] = [[0, 0, 0], [255, 255, 255]];
+  const D = det(A);
+  if (Math.abs(D) > 1e-9) {
+    const X = [0, 1, 2].map((k) => det(A.map((row, r) => row.map((x, c) => (c === k ? v[r] : x)))) / D);
+    if (X.every((x) => x >= -12 && x <= 267)) cands.push(X.map((x) => Math.max(0, Math.min(255, Math.round(x)))));
+  }
+  let best: { X: number[]; ok: number; bases: number } | null = null;
+  for (const X of cands) { const s = support(X); if (s.bases >= 2 && (!best || s.ok > best.ok)) best = { X, ...s }; }
+  return best && best.ok >= 0.4 * px.length ? (best.X as [number, number, number]) : null;
 }
 
 /**
@@ -654,4 +724,16 @@ export function coverageLabels(src: Raster, pal: Palette, W: number, H: number, 
     }
   }
   return out;
+}/** P ≈ A + u (B − A) + t (X − A) (u, t ≥ 0, u + t ≤ 1): üçgen karışımına uzaklık ve X'in payı t. */
+export function triMix(P: number[], A: number[], B: number[], X: number[]): { dist: number; t: number } {
+  const e1 = [B[0] - A[0], B[1] - A[1], B[2] - A[2]], e2 = [X[0] - A[0], X[1] - A[1], X[2] - A[2]], d = [P[0] - A[0], P[1] - A[1], P[2] - A[2]];
+  const a11 = e1[0] ** 2 + e1[1] ** 2 + e1[2] ** 2, a22 = e2[0] ** 2 + e2[1] ** 2 + e2[2] ** 2, a12 = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
+  const b1 = d[0] * e1[0] + d[1] * e1[1] + d[2] * e1[2], b2 = d[0] * e2[0] + d[1] * e2[1] + d[2] * e2[2];
+  const det = a11 * a22 - a12 * a12;
+  let u = 0, t = a22 > 1e-9 ? b2 / a22 : 0;
+  if (det > 1e-6) { u = (b1 * a22 - b2 * a12) / det; t = (a11 * b2 - a12 * b1) / det; }
+  u = Math.max(0, Math.min(1, u)); t = Math.max(0, Math.min(1 - u, t));
+  return { dist: Math.hypot(d[0] - u * e1[0] - t * e2[0], d[1] - u * e1[1] - t * e2[1], d[2] - u * e1[2] - t * e2[2]), t };
 }
+
+
