@@ -14,7 +14,7 @@ import type { VDocument } from '../common/types.js';
 
 const args = parseArgs();
 // İlk konumsal argüman = girdi (değer alan --seçeneklerin değerleri atlanır)
-const FLAGS = new Set(['help', 'diff', 'no-reference', 'overwrite']);
+const FLAGS = new Set(['help', 'diff', 'no-reference', 'no-optimize', 'overwrite']);
 let input: string | undefined;
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
@@ -38,6 +38,8 @@ Kullanım: masvector-vectorize <girdi.pdf|png|jpg|webp|...> [seçenekler]
   --background B      auto|keep|remove
   --method M          overlap|stacked|abutting
   --no-reference      Referans (kaynak) katmanı ekleme
+  --optimize MS       Render döngülü optimizasyonun süre bütçesi (ms; varsayılan otomatik ≤ 8000)
+  --no-optimize       Optimizasyonu kapat (daha hızlı, düşük çözünürlükte daha az doğru)
   --diff              Fark haritası PNG'si yaz (…-fark.png)
   --password P        Şifreli PDF parolası
 Rapor (sadakat metrikleri) stdout'a JSON olarak yazılır.`);
@@ -53,6 +55,7 @@ const trace: VectorizeImageOptions = {
   background: args.background as VectorizeImageOptions['background'],
   method: args.method as VectorizeImageOptions['method'],
   keepReference: args.reference !== false,
+  optimize: args.optimize === false ? false : num('optimize'),
 };
 const formats = new Set(String(args.formats ?? 'svg,json').split(',').map((s) => s.trim()));
 const abs = path.resolve(input);

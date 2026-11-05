@@ -121,6 +121,7 @@ export function createMcpServer(backend: Backend, opts: McpOptions): McpServer {
     background: z.enum(['auto', 'keep', 'remove']).optional().describe('auto: düz arka plan frame arka planı olur'),
     method: z.enum(['overlap', 'stacked', 'abutting']).optional().describe('overlap (önerilen): bağımsız şekiller, boşluksuz'),
     refine: z.boolean().optional().describe('Kalite hedefi tutmazsa ayarları kendisi sıkılaştırır (varsayılan true)'),
+    optimize: z.union([z.boolean(), z.number().int().min(0).max(120000)]).optional().describe('Render döngülü geometri optimizasyonu: çapa/kol/ince çizgi rengi kaynağa alt piksel hassasiyetle oturtulur (düşük çözünürlükte büyük kazanç). true/false ya da süre bütçesi ms (varsayılan açık, ≤8 s)'),
   };
   reg('vectorize_image', 'Raster görseli (PNG/JPEG/WebP/GIF/BMP/TIFF) profesyonel vektöre çevir: OKLab renk nicemleme, renk başına bağımsız şekil, pürüzsüz Bézier, sivri köşe onarımı. Sonuç kaynakla piksel piksel doğrulanır (report.fidelity: pctOff < %0.25 mükemmel, < %1 çok iyi). mode=replace TÜM belgeyi yeni belgeyle değiştirir (önceki frame ve id\'ler kaybolur; gizli+kilitli "Referans" katmanı + "Vektör" katmanı); mode=merge mevcut belgeye grup olarak yerleştirir (parentId ile hedef, placement ile konum/boyut). Mod verilmez ve parentId/placement varsa merge varsayılır. Ardından compare_reference ile fark haritasını görün.', {
     path: z.string().optional().describe('Görsel dosyası (sunucu çalışma dizinine göreli)'),

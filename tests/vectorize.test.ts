@@ -14,6 +14,8 @@ import { compareDocument } from '../src/vectorize/compare.js';
 import { pdfToDoc, vectorizeImageToDoc } from '../src/vectorize/index.js';
 import { popplerAvailable, popplerBin, popplerEnv } from '../src/vectorize/pdf.js';
 import { traceImage } from '../src/vectorize/trace.js';
+import { refineGroup } from '../src/vectorize/refine.js';
+import { createDocument } from '../src/model/scene.js';
 import { walk } from '../src/model/scene.js';
 import type { PathNode, VDocument } from '../src/common/types.js';
 
@@ -204,4 +206,43 @@ describe('v1.1 zor girdiler', () => {
     expect(r.report.warnings.join(' ')).not.toMatch(/Fotoğraf/);
     expect(vectorPaths(doc1(r)).length).toBeLessThanOrEqual(4);
   }, 120_000);
+});
+
+describe('render döngülü optimizasyon (düşük çözünürlük)', () => {
+  // 64 birimlik sahne: mor yıldız + 1.3 birim lacivert yay (kenar yumuşatmalı)
+  const star = (size: number) => {
+    const s = size / 64, cv = createCanvas(size, size), c = cv.getContext('2d');
+    c.fillStyle = '#f8fafc'; c.fillRect(0, 0, size, size);
+    c.fillStyle = '#7c3aed'; c.beginPath();
+    for (let i = 0; i < 10; i++) { const r = (i % 2 ? 11 : 28) * s, a = (i * Math.PI) / 5 - Math.PI / 2; c.lineTo(32 * s + r * Math.cos(a), 33 * s + r * Math.sin(a)); }
+    c.closePath(); c.fill();
+    c.strokeStyle = '#0f172a'; c.lineWidth = 1.3 * s; c.beginPath(); c.arc(32 * s, 33 * s, 30 * s, 0.3, 2.8); c.stroke();
+    return { buf: cv.toBuffer('image/png'), img: decodeImageBuffer(cv.toBuffer('image/png'))! };
+  };
+
+  it('çapalar kaynağa oturur: hata belirgin düşer, geniş dolgunun rengi değişmez', async () => {
+    const { img } = star(48);
+    const r = await traceImage(img, {});
+    const ref = { rgba: img.rgba, width: img.width, height: img.height };
+    const doc = createDocument('t', r.width, r.height);
+    doc.pages[0].frames[0].background = r.background ?? 'none';
+    doc.pages[0].frames[0].nodes = [r.group];
+    const before = compareDocument(doc, ref).metrics;
+    const fills = r.group.children.map((c) => (c as PathNode).style.fill);
+    const rep = refineGroup(r.group, ref, r.background, { budgetMs: 20_000 });
+    const after = compareDocument(doc, ref).metrics;
+    expect(rep.after).toBeLessThan(rep.before * 0.7);
+    expect(after.psnr).toBeGreaterThan(before.psnr + 4);
+    expect(after.pctOff).toBeLessThan(before.pctOff);
+    // Yıldız (geniş dolgu) rengi birebir korunur
+    const purple = fills.findIndex((f) => f === '#7c3bed' || f === '#7c3aed');
+    expect((r.group.children[purple] as PathNode).style.fill).toBe(fills[purple]);
+  }, 60_000);
+
+  it('24 px kenar yumuşatmalı görsel piksel-birebir kareye düşmez, pürüzsüz ve sadık kalır', async () => {
+    const r = await vectorizeImageToDoc(star(24).buf);
+    expect(r.report.fidelity!.pctOff).toBeLessThan(0.5);
+    expect(vectorPaths(r.doc).every((p) => !p.name.startsWith("Piksel"))).toBe(true);
+    expect(r.report.stats?.optimize).toBeTruthy();
+  }, 60_000);
 });

@@ -8,6 +8,7 @@ import { rgbaToDataUri } from '../render/image-ops.js';
 import { traceImage, type TraceOptions, type TraceResult } from './trace.js';
 import { exactColorCount, neighborDiff, pixelEdgeDensity, pixelTrace } from './pixel.js';
 import { cleanReference, compareDocument, type CompareMetrics } from './compare.js';
+import { refineGroupIsolated } from './refine.js';
 import { importPDF, type PdfImportOptions } from './pdf.js';
 
 // Üst düzey vektörleştirme API'si: Document Server, MCP ve CLI aynı fonksiyonları kullanır.
@@ -20,6 +21,12 @@ export const isPdf = (file: string, buf?: Buffer) => /\.pdf$/i.test(file) || (!!
 export interface VectorizeImageOptions extends TraceOptions {
   /** Kalite hedefi karşılanmazsa parametreleri ayarlayıp yeniden dene (varsayılan true). */
   refine?: boolean;
+  /**
+   * Render döngülü geometri optimizasyonu: izleme sonrası çapa/kol/renk/kontur genişliği kaynağa alt piksel
+   * hassasiyetle oturtulur (düşük çözünürlükte kenar yumuşatma pikselleri kenar konumunu taşır). true/false ya da
+   * süre bütçesi (ms). Varsayılan: açık, bütçe çapa sayısına göre (≤ 8 s).
+   */
+  optimize?: boolean | number;
   /** Kaynak kayıplı sıkıştırılmış (JPEG/kayıplı WebP): ölçüt gürültüsü giderilmiş kaynağa karşı yapılır. */
   lossySource?: boolean;
   /** Kaynak görseli kilitli+gizli "Referans" katmanı olarak ekle (varsayılan true). */
@@ -33,7 +40,7 @@ export interface VectorizeReport {
   fidelity: CompareMetrics | null;
   palette?: TraceResult['palette'];
   stats?: TraceResult['stats'];
-  attempts?: { options: Partial<TraceOptions>; pctOff: number; anchors: number }[];
+  attempts?: { options: Partial<VectorizeImageOptions>; pctOff: number; anchors: number }[];
   cleanup?: unknown;
   warnings: string[];
 }
@@ -70,7 +77,10 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
     f.nodes = [r.group];
     // Piksel-birebir aday HAM kaynağa karşı ölçülür: kaynağın her pikselini (gürültüsü dahil) içerik sayar
     const m = pixel ? { ...compareDocument(doc, { rgba: img.rgba, width: img.width, height: img.height }).metrics, reference: 'kaynak' as const } : { ...compareDocument(doc, ref, { chroma: !!o.lossySource }).metrics, reference: refKind };
-    attempts.push({ options: { colors: opts.colors, detail: opts.detail, maxColors: opts.maxColors, smoothness: opts.smoothness, gradients: opts.gradients, ...(opts.segScale ? { segScale: opts.segScale } : {}) }, pctOff: m.pctOff, anchors: r.stats.anchors });
+    return finish(r, m, opts);
+  };
+  const finish = (r: TraceResult, m: any, opts: TraceOptions) => {
+    attempts.push({ options: { colors: opts.colors, detail: opts.detail, maxColors: opts.maxColors, smoothness: opts.smoothness, gradients: opts.gradients, ...(opts.segScale ? { segScale: opts.segScale } : {}), ...((opts as VectorizeImageOptions).optimize ? { optimize: true } : {}) } as Partial<VectorizeImageOptions>, pctOff: m.pctOff, anchors: r.stats.anchors });
     return { r, m };
   };
   // Dama / titreşim (dither) deseni (az TAM renk + komşuların çoğu farklı) ya da saf gürültü/doku (komşu farkı çok
@@ -124,6 +134,11 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
       if (best.m.pctOff <= 0.5) break;
     }
   }
+  // Render döngülü optimizasyon (piksel-birebir yedeklerinden ÖNCE: optimize edilmiş pürüzsüz sonuç onlarla yarışır)
+  if (o.optimize !== false && o.refine !== false && best.m.pctOff > 0) {
+    const opt = await optimizeResult(best.r, best.m, ref!, typeof o.optimize === 'number' ? o.optimize : undefined, !!o.lossySource, refKind);
+    if (opt) best = finish(opt.r, opt.m, { ...o, optimize: true } as VectorizeImageOptions);
+  }
   // Sert kenarlı piksel grafiği (az sayıda TAM renk) ya da çok küçük görsel ve pürüzsüz izleme zayıfsa:
   // piksel-birebir vektör (piksel sanatı, 1-bit titreşimli, 1 px desen, 16–64 px ikonlar)
   if (o.refine !== false && !o.palette?.length && best.m.pctOff > 0.5) {
@@ -141,6 +156,55 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
   // Sonuç iyiyse "fotoğraf benzeri" uyarısı yanıltıcıdır (ör. gürültülü logo): kaldır
   if (best.m.pctOff <= 0.5) best.r.warnings = best.r.warnings.filter((w) => !w.startsWith('Fotoğraf benzeri'));
   return { ...best, attempts };
+}
+
+/**
+ * İzleme sonucunu render döngülü optimizasyonla iyileştir (kopya üzerinde). Ölçüt (pctOff) kötüleşmez ve PSNR
+ * artarsa yeni sonuç; aksi hâlde null.
+ */
+async function optimizeResult(r: TraceResult, m0: CompareMetrics & { reference: string }, ref: { rgba: Uint8ClampedArray; width: number; height: number }, budgetMs: number | undefined, chroma: boolean, refKind: string) {
+  const measure = (g: GroupNode) => {
+    const doc = createDocument('t', r.width, r.height);
+    const f = doc.pages[0].frames[0];
+    f.background = r.background ?? 'none';
+    f.nodes = [g];
+    return { ...compareDocument(doc, ref, { chroma }).metrics, reference: refKind };
+  };
+  if (!r.group.children.some((c) => c.type === 'path')) return null;
+  const group = structuredClone(r.group);
+  // Bütçe: çapa sayısıyla ölçeklenir (küçük görselde birkaç yüz ms; büyükte en çok 8 s)
+  const budget = budgetMs ?? Math.min(8000, 1500 + r.stats.anchors * 6);
+  const rep = await refineGroupIsolated(group, ref, r.background, { budgetMs: budget });
+  let m1 = measure(group);
+  const ok = (a: typeof m0, b: typeof m0) => a.pctOff <= b.pctOff + 1e-9 && a.psnr > b.psnr + 0.05;
+  if (!ok(m1, m0) && group.children.length <= 24) {
+    // Bütün olarak kabul edilmedi (ör. ince çizgide MSE düşerken eşikli ölçüt artıyor): şekil şekil seç —
+    // optimize edilmiş şekil ancak ölçütü iyileştiriyorsa alınır
+    const mixed = structuredClone(r.group);
+    let mm = m0;
+    group.children.forEach((c, i) => {
+      if (c.type !== 'path') return;
+      const prev = mixed.children[i];
+      mixed.children[i] = c;
+      const t = measure(mixed);
+      if (ok(t, mm)) mm = t; else mixed.children[i] = prev;
+    });
+    group.children = mixed.children;
+    m1 = mm;
+  }
+  if (!ok(m1, m0)) return null;
+  let anchors = 0;
+  for (const c of group.children) if (c.type === 'path') for (const sp of c.subpaths) anchors += sp.points.length;
+  // Rengi ayarlanan (ince) şekillerin palet kaydı güncellenir
+  const palette = r.palette.map((e) => ({ ...e }));
+  r.group.children.forEach((c, i) => {
+    const d = group.children[i];
+    if (c.type !== 'path' || d?.type !== 'path' || typeof c.style.fill !== 'string' || typeof d.style.fill !== 'string' || c.style.fill === d.style.fill) return;
+    const e = palette.find((q) => q.color === c.style.fill);
+    if (e) e.color = d.style.fill;
+  });
+  const warnings = [...r.warnings];
+  return { r: { ...r, group, palette, stats: { ...r.stats, anchors, optimize: { psnrBefore: m0.psnr, ms: rep.ms, moves: rep.moves, splits: rep.splits } }, warnings }, m: m1 };
 }
 
 /** Görsel → yeni belge (Referans + Vektör katmanları). */
@@ -202,13 +266,14 @@ export async function pdfToDoc(file: string, o: PdfImportOptions & { trace?: Vec
     x += frame.w + 40;
     if (p.kind === 'scanned' && o.traceScanned !== false && p.raster) {
       const img = decodeImageBuffer(p.raster)!;
-      const { r, m, attempts } = await traceBest(img, o.trace ?? {});
-      const s = frame.w / r.width;
-      r.group.transform = { a: s, b: 0, c: 0, d: frame.h / r.height, e: 0, f: 0 };
-      const ref = referenceImage(img, frame.w, frame.h);
+      const { r, m, attempts } = await traceBest(img, { lossySource: isLossy(p.raster), ...(o.trace ?? {}) });
+      const box = p.rasterBox ?? { x: 0, y: 0, w: frame.w, h: frame.h };
+      r.group.transform = { a: box.w / r.width, b: 0, c: 0, d: box.h / r.height, e: box.x, f: box.y };
+      const ref = referenceImage(img, box.w, box.h);
+      ref.x = box.x; ref.y = box.y;
       frame.background = r.background ?? 'none';
       frame.nodes = [layer('Referans (taranmış sayfa)', [ref], { visible: false, locked: true }), layer('Vektör', [r.group])];
-      reports.push({ page: p.page, frameId: frame.id, kind: 'pdf-scanned', preset: r.preset, fidelity: m, palette: r.palette, stats: r.stats, attempts, warnings: [...p.warnings, ...r.warnings, 'Sayfa taranmış (raster) görünüyor; 300 dpi üzerinden vektör izleme yapıldı'] });
+      reports.push({ page: p.page, frameId: frame.id, kind: 'pdf-scanned', preset: r.preset, fidelity: m, palette: r.palette, stats: r.stats, attempts, warnings: [...p.warnings, ...r.warnings, p.nativeDpi ? `Sayfa taranmış (raster); gömülü görüntü doğal çözünürlüğünde (${p.nativeDpi} dpi) izlendi` : 'Sayfa taranmış (raster) görünüyor; 300 dpi üzerinden vektör izleme yapıldı'] });
     } else {
       reports.push({ page: p.page, frameId: frame.id, kind: 'pdf-vector', fidelity: p.fidelity ?? null, cleanup: p.cleanup, warnings: p.warnings });
     }

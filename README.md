@@ -122,6 +122,13 @@ npm run vectorize -- kurumsal.png --palette "#d91933,#193373,#f3a619"
 - **Kaydırılmış gölge (1.1):** drop shadow'da örtücü nesnenin kayması aranır. σ ve opaklık, "kaydırılmış şekil ⊛ Gauss" modelinin görünen alfaya uydurulmasıyla bulunur.
 - **Piksel-birebir kip (1.1):** dama, titreşimli (dithered) 1-bit görseller, piksel sanatı, ≤32 px ikonlar ve ince şeritler, TAM renk başına birleştirilmiş dikdörtgenlerle kesin vektöre çevrilir. Pürüzsüz yorum için `refine: false` kullanın.
 - **Karmaşıklık cezası (1.1):** basit sonuç zaten çok iyiyse (≤%1,5), 3 kattan fazla çapa kullanan "daha sadık" sonuç seçilmez. JPEG'li küçük logoda onlarca renk bölgesi yerine 4 temiz renk çıkar.
+- **Render döngülü optimizasyon (1.2):** izleme bittikten sonra her çapa, Bézier kolu, ince şekil rengi ve kontur genişliği, **kaynak piksellere karşı** yeniden çizilerek alt piksel adımlarla (0,5 → 0,0625 px) oturtulur (DiffVG benzeri, türevsiz koordinat inişi). Eğitim verisi gerekmez; her görsel kendi kendini optimize eder.
+  - Düşük çözünürlükte kenar yumuşatma pikselleri kenarın alt piksel konumunu taşır: 24–64 px logolarda PSNR 27 → 38 dB, 8× büyütülmüş gerçek şekle hata %1,7 → %0,3.
+  - Kol sıfırlama denemesi spline'ın yuvarladığı sivri köşeleri geri kazanır; hatası yüksek kalan segmentler birebir ikiye bölünüp yeni çapayla yeniden oturtulur; uzunluk cezası görünmez iğne/dalga üretimini engeller.
+  - Geniş düz dolguların rengi değişmez (kurumsal renk korunur); yalnız ortalama genişliği < 2 px olan şekillerin rengi kenar yumuşatmasından kestirilir (1 px yay: #3e5042 → gerçek lacivert).
+  - Değişen yalnız komşu iki segmentin kutusu yeniden çizilir; pencereye değmeyen alt yollar çizilmez. Sonuç ancak ölçüt (pctOff) kötüleşmez ve PSNR artarsa alınır; bütün olarak tutmazsa şekil şekil seçilir.
+  - Küçük kenar yumuşatmalı görseller artık piksel-birebir karelere düşmez: optimize edilmiş pürüzsüz sonuç onlarla yarışır (24 px yıldız: 8× gerçek şekle hata %15,5 → %6,9).
+  - `optimize: false` kapatır, sayı verilirse süre bütçesidir (ms; varsayılan çapa sayısına göre ≤ 8 s). Kurulu sürümde iş kısa ömürlü worker'larda koşar (`@napi-rs/canvas` okuma tamponları süreç içinde serbest kalmıyor).
 
 **Doğrulama ölçütü:**
 - Algısal renk farkı (OKLab ΔE > 0,04) üzerinden hesaplanır.
@@ -148,16 +155,16 @@ npm run vectorize -- kurumsal.png --palette "#d91933,#193373,#f3a619"
 
 **Stres testi (1.1):** `npm run stress` 46 zor girdi üretir ve her birini ayrı süreçte ölçer. Girdiler: 1×1 ile 3000² arası boyutlar, 6000×160 panorama, 20×900 şerit, kıl çizgiler, 8–110 px metin, doğrusal/radyal/bantlı gradyan, yarı saydam örtüşme, kaydırılmış yumuşak gölge, JPEG q10/q30, bulanık, gürültülü, perspektifli "telefon fotoğrafı", 64 renk, piksel sanatı, 1 px dama, saf gürültü, CMYK/EXIF/16-bit/1-bit/GIF/WebP/BMP/TIFF, bozuk dosyalar, eğik ve çok sayfalı taranmış PDF.
 
-| | 1.0 | 1.1 |
-|---|---|---|
-| Mükemmel / çok iyi / iyi / zayıf (+3 bozuk dosya: anlamlı hata) | 25 / 5 / 6 / 7 | 30 / 7 / 4 / 2 |
-| 512 px logo | 6,2 s | 1,0 s |
-| Bulanık logo | 25,7 s (%0,92) | 8,0 s (%0,20) |
-| 1 px dama / 1-bit titreşim | 99 s / 87 s (zayıf) | 0,1 s / 0,2 s (%0) |
-| Kaydırılmış yumuşak gölge | %13,7 | %0,002 |
-| Gürültülü logo (σ≈18) | %4,9 | %0,10 |
+| | 1.0 | 1.1 | 1.2 |
+|---|---|---|---|
+| Mükemmel / çok iyi / iyi / zayıf (+3 bozuk dosya: anlamlı hata) | 25 / 5 / 6 / 7 | 30 / 7 / 4 / 2 | 35 / 7 / 1 / 0 |
+| 512 px logo | 6,2 s | 1,0 s | 3,8 s (%0,005 → %0) |
+| Bulanık logo | 25,7 s (%0,92) | 8,0 s (%0,20) | 18 s (%0,03) |
+| 1 px dama / 1-bit titreşim | 99 s / 87 s (zayıf) | 0,1 s / 0,2 s (%0) | aynı |
+| Kaydırılmış yumuşak gölge | %13,7 | %0,002 | %0 |
+| Gürültülü logo (σ≈18) | %4,9 | %0,10 | %0,08 |
 
-Zayıf kalan iki girdi: 1 px kenar yumuşatmalı kıl çizgiler (%7,8; kusursuz geometriyle çizilmiş vektör bile bu kaynağa göre %1,4 alır) ve saf rastgele gürültü (vektörle temsil edilemez).
+1.2'de toplam fark (43 geçerli girdi) %6,65 → %5,13: 48 px ikon %0,17 → %0, ışın yıldızı %0,26 → %0,09, metin boyları %0,75 → %0,33, çok sayfalı tarama %0,86 → %0,66, gri çizim %1,15 → %1,02. Bedeli süre: korpus toplamı 167 s → 315 s. Saf rastgele gürültü vektörle temsil edilemez (piksel-birebir kipe düşer).
 
 ## MCP yüzeyi
 
@@ -195,7 +202,8 @@ Zayıf kalan iki girdi: 1 px kenar yumuşatmalı kıl çizgiler (%7,8; kusursuz 
 
 ## Bilinen sınırlar
 
-- 1 px kenar yumuşatmalı kıl çizgiler dış hat olarak izlenir: renk ve süreklilik doğrudur ama kalınlık/konum ±0,5 px dalgalanabilir (merkez çizgisi/stroke çıkarımı yok).
+- 1 px kenar yumuşatmalı kıl çizgilerde kare hata ile eşikli ölçüt çelişebilir (MSE düşerken fark artar); optimizasyon bu şekillerde kendini geri çeker, kıl çizgi girdisi %0,66'da kalır.
+- Çok küçük serif metin (≤ 8 px) temel izlemede kalın kontura dönebilir; optimizasyon konumu düzeltir ama topolojiyi (harf boşluklarını) değiştirmez.
 - Fotoğraflar vektörleştirilebilir ama sonuç ağırdır (binlerce şekil) ve fotoğrafik ayrıntı basitleşir; vektör, logo/illüstrasyon/çizim için doğru araçtır.
 - SVG yalnız doğrusal/radyal gradyanı destekler: karmaşık 2B renk geçişleri birkaç gradyan bölgesine bölünür (yakından bakınca hafif dikiş görülebilir).
 - PDF içe aktarma poppler-utils gerektirir (`sudo apt install poppler-utils`). PDF metinleri glif eğrisi olarak gelir (görünüm birebir, düzenlenebilir metin değil).

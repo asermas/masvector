@@ -18,9 +18,11 @@ if (process.env.MV_STRESS_ONE) {
   // —— çocuk süreç: tek dosya
   const file = process.env.MV_STRESS_ONE;
   const { readFileSync } = await import('node:fs');
-  const { isPdf, pdfToDoc, vectorizeImageToDoc } = await import('../src/vectorize/index.js');
-  const { renderPNG } = await import('../src/render/png.js');
-  const { walk } = await import('../src/model/scene.js');
+  // MV_DIST=1: derlenmiş kodla koş (kurulu uygulamadaki gibi: optimizasyon worker'larda)
+  const base = process.env.MV_DIST ? '../dist' : '../src';
+  const { isPdf, pdfToDoc, vectorizeImageToDoc } = await import(`${base}/vectorize/index.js`);
+  const { renderPNG } = await import(`${base}/render/png.js`);
+  const { walk } = await import(`${base}/model/scene.js`);
   const t0 = performance.now();
   let peak = 0;
   const tick = setInterval(() => { peak = Math.max(peak, process.memoryUsage().rss); }, 20);
