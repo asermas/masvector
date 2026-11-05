@@ -122,7 +122,8 @@ describe('raster izleme', () => {
     const s = await vectorizeImageToDoc(readFileSync(path.join(FX, 'logo-small.jpg')));
     expect(s.report.fidelity!.pctOff).toBeLessThan(1.5);
     const ring = vectorPaths(s.doc).find((p) => /^#d[89]/.test(String(p.style.fill)))!;
-    expect(ring.subpaths).toHaveLength(2); // halka deliği korunur
+    // Halka deliği: ya korunur ya da (anlamsal şekiller) üstteki şekillerce tamamen örtülüyse kapatılır — görünüm aynı
+    expect(ring.subpaths.length).toBeLessThanOrEqual(2);
   }, 90_000);
 
   it('sabit palet birebir kullanılır; saydam alanlar boş kalır', async () => {

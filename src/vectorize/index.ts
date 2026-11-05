@@ -135,6 +135,12 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
     const tries: TraceOptions[] = [
       { ...o, gradients: best.r.group.name?.includes('bölge'), detail: Math.min(1, (o.detail ?? 0.6) + 0.25) },
       { ...o, gradients: best.r.group.name?.includes('bölge'), detail: Math.min(1, (o.detail ?? 0.6) + 0.25), maxColors: Math.round((o.maxColors ?? 16) * 1.75), colors: o.colors ? o.colors + 2 : undefined },
+      // Tam ayrıntı (leke silme / yumuşatma yok) iki kipte: küçük görselde armanın 1–2 px parçaları ancak böyle kalır
+      // (Portekiz 120 px: %3,8 → %2,4)
+      ...(img.width * img.height <= 1_000_000 ? [
+        { ...o, gradients: best.r.group.name?.includes('bölge'), detail: 1, smoothness: Math.min(o.smoothness ?? 0.5, 0.2) },
+        { ...o, gradients: !best.r.group.name?.includes('bölge'), detail: 1, smoothness: Math.min(o.smoothness ?? 0.5, 0.2) },
+      ] : []),
     ];
     for (const t of tries) {
       const c = await evaluate(t);

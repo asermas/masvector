@@ -68,7 +68,7 @@ async function worker() {
   while (next < files.length) {
     const i = next++, f = files[i];
     rows[i] = await new Promise<any>((res) => execFile(process.execPath, ['--import', 'tsx', path.join(here, 'flagbench.ts')], {
-      env: { ...process.env, MV_FB_ONE: path.join(dir, f), MV_FB_OUT: outDir }, timeout: 300000, maxBuffer: 16 << 20,
+      env: { ...process.env, MV_FB_ONE: path.join(dir, f), MV_FB_OUT: outDir }, timeout: 900000, maxBuffer: 16 << 20,
     }, (e, out, err) => { try { res({ file: f, ...JSON.parse(String(out)) }); } catch { res({ file: f, ok: false, error: String(err || e?.message).slice(0, 300) }); } }));
     const r = rows[i];
     console.log(`${f.padEnd(26)} ${r.ok ? `off=${String(r.pctOff).padEnd(6)} gt=${String(r.gt ?? '-').padEnd(6)} gt4=${String(r.gt4 ?? '-').padEnd(6)} paths=${String(r.paths).padEnd(4)} prim=${r.prims} col=${r.colors} grad=${r.grads}${r.pixel ? ' PIKSEL' : ''} ${r.ms}ms` : 'HATA ' + r.error}`);

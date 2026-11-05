@@ -21,7 +21,41 @@ type Box = [number, number, number, number];
 /** Varsayılan alt piksel adım çizelgesi (px). */
 export const REFINE_STEPS = [0.5, 0.25, 0.125, 0.0625];
 
-export type RefineOptions = { budgetMs?: number; steps?: number[]; handles?: boolean; split?: boolean; /** Uzunluk cezası (düğüm kontrastının² payı / px). */ lambda?: number; loss?: 'l1' | 'l2'; /** Önceki çağrının report.resume değeri. */ resume?: number[][][]; /** Okunan piksel baytı sınırı (worker dilimi). */ maxReadBytes?: number };
+export type RefineOptions = { budgetMs?: number; steps?: number[]; handles?: boolean; split?: boolean; /** Uzunluk cezası (düğüm kontrastının² payı / px). */ lambda?: number; loss?: 'l1' | 'l2'; /** Önceki çağrının report.resume değeri. */ resume?: number[][][]; /** Okunan piksel baytı sınırı (worker dilimi). */ maxReadBytes?: number;
+  /** Dilim devamı: baştaki renk geçişi atlanır (önceki dilim yaptı). */ skipFirstPaint?: boolean;
+  /** Paralel bölüm: bu çağrı yalnız k. paydaki alt yolları (ve düğüm renklerini) optimize eder (n pay). */ part?: { k: number; n: number } };
+
+/** Optimize edilebilir yol düğümleri (refineGroup'un hedef sırası). */
+export function refineTargets(group: GroupNode): PathNode[] {
+  const out: PathNode[] = [];
+  const visit = (n: VNode) => { if (!n.visible) return; if (n.type === 'group') n.children.forEach(visit); else if (n.type === 'path' && !n.style.filters?.length) out.push(n); };
+  group.children.forEach(visit);
+  return out;
+}
+
+/**
+ * Paralel paylaşım: alt yollar merkezlerine göre (önce y şeritleri, şerit içinde x) sıralanır ve çapa sayısı eşit
+ * n paya bölünür — komşu çapalar çoğunlukla aynı payda kalır, yük dengelidir. owner[ti][si] = pay; düğüm rengi
+ * (paint) payı = ti mod n. Tüm worker'larda ve birleştirmede aynı sonucu verir (deterministik).
+ */
+export function refineOwnership(targets: PathNode[], n: number): { sub: number[][]; node: number[] } {
+  const items: { ti: number; si: number; key: number; a: number }[] = [];
+  let tot = 0, maxY = 1;
+  targets.forEach((t) => t.subpaths.forEach((sp) => sp.points.forEach((p) => { if (p.y > maxY) maxY = p.y; })));
+  const bands = Math.max(1, n);
+  targets.forEach((t, ti) => t.subpaths.forEach((sp, si) => {
+    let cx = 0, cy = 0; for (const p of sp.points) { cx += p.x; cy += p.y; }
+    const k = Math.max(1, sp.points.length); cx /= k; cy /= k;
+    const band = Math.min(bands - 1, Math.floor((cy / (maxY + 1)) * bands));
+    items.push({ ti, si, key: band * 1e7 + (band % 2 ? -cx : cx), a: sp.points.length });
+    tot += sp.points.length;
+  }));
+  items.sort((a, b) => a.key - b.key);
+  const sub = targets.map((t) => t.subpaths.map(() => 0));
+  let acc = 0;
+  for (const it of items) { sub[it.ti][it.si] = Math.min(n - 1, Math.floor((acc / Math.max(1, tot)) * n)); acc += it.a; }
+  return { sub, node: targets.map((_, ti) => ti % n) };
+}
 
 const FLAT = (rgba: Uint8ClampedArray, n: number) => {
   const o = new Float32Array(n * 3);
@@ -217,6 +251,11 @@ export function refineGroup(group: GroupNode, ref: { rgba: Uint8ClampedArray; wi
   let moves = 0, sweeps = 0, splits = 0;
   // Çapa başına "aktif" bayrağı: son geçişte iyileşmeyen ve komşusu da değişmeyen çapa sonraki geçişte atlanır
   const active: Uint8Array[][] = targets.map((L) => L.n.subpaths.map((sp) => new Uint8Array(sp.points.length).fill(1)));
+  // Paralel pay: sahip olunmayan alt yollar/düğüm renkleri dokunulmaz (yalnız çizilir)
+  const own = o.part && o.part.n > 1 ? refineOwnership(targets.map((L) => L.n), o.part.n) : null;
+  const mineSub = (ti: number, si: number) => !own || own.sub[ti][si] === o.part!.k;
+  const mineNode = (ti: number) => !own || own.node[ti] === o.part!.k;
+  const maskActive = () => { if (own) active.forEach((a, ti) => a.forEach((v, si) => { if (!mineSub(ti, si)) v.fill(0); })); };
   const timeUp = () => Date.now() - t0 > budget || readBytes > (o.maxReadBytes ?? Infinity);
   /** Bir çapanın serbestlik dereceleri üzerinde koordinat inişi; iyileşme olduysa true. */
   const lamFrac = o.lambda ?? 0.03;
@@ -291,8 +330,9 @@ export function refineGroup(group: GroupNode, ref: { rgba: Uint8ClampedArray; wi
   const hx = (c: number[]) => '#' + c.map((x) => Math.max(0, Math.min(255, x)).toString(16).padStart(2, '0')).join('');
   /** Düz dolgu/kontur rengi ve kontur genişliği: düğüm kutusunda koordinat inişi (ince çizginin rengi AA'dan kestirilir). */
   const paintPass = () => {
-    for (const L of targets) {
+    for (const [ti, L] of targets.entries()) {
       if (timeUp()) return;
+      if (!mineNode(ti)) continue;
       const s = L.n.style;
       const box = clampBox(L.box);
       if ((box[2] - box[0]) * (box[3] - box[1]) > 600_000) continue;
@@ -350,6 +390,7 @@ export function refineGroup(group: GroupNode, ref: { rgba: Uint8ClampedArray; wi
       const L = targets[ti];
       const M = multiply(L.m, L.n.transform);
       for (let si = 0; si < L.n.subpaths.length && added < maxNew; si++) {
+        if (!mineSub(ti, si)) continue;
         const sp = L.n.subpaths[si];
         const segs = sp.closed ? sp.points.length : sp.points.length - 1;
         const out: SubPath['points'] = [];
@@ -414,13 +455,14 @@ export function refineGroup(group: GroupNode, ref: { rgba: Uint8ClampedArray; wi
   };
   const resetActive = () => targets.forEach((L, ti) => L.n.subpaths.forEach((sp, si) => { active[ti][si] = new Uint8Array(sp.points.length).fill(1); }));
   let completed = 0;
-  paintPass();
+  if (!o.skipFirstPaint) paintPass();
   for (const step of steps) {
     if (timeUp()) break;
     // Önceki dilimden devam: yarım kalan adımın etkin çapa bayrakları (şekil eşleşiyorsa) korunur
     const res = completed === 0 ? o.resume : undefined;
     if (res && res.length === active.length && res.every((a, ti) => a.length === active[ti].length && a.every((v, si) => v.length === active[ti][si].length))) res.forEach((a, ti) => a.forEach((v, si) => { active[ti][si] = Uint8Array.from(v); }));
     else resetActive();
+    maskActive();
     anchorPass(step);
     // Kaba adımlardan sonra: hâlâ hatalı segmentlere çapa ekle, aynı adımla yeniden oturt
     if (step >= 0.125 && o.split !== false && !timeUp()) {
@@ -454,9 +496,61 @@ export async function refineGroupIsolated(group: GroupNode, ref: { rgba: Uint8Cl
   const url = new URL('./refine-worker.js', import.meta.url);
   let file: string | null = null;
   try { file = fileURLToPath(url); if (!existsSync(file)) file = null; } catch { file = null; }
+  // Kaynak (tsx) ortamında da worker isteniyorsa (kıyas betikleri: MV_TS_WORKERS=1): .ts worker'ı tsx ile
+  let execArgv: string[] | undefined;
+  if (!file && process.env.MV_TS_WORKERS) {
+    try { const f = fileURLToPath(new URL('./refine-worker.ts', import.meta.url)); if (existsSync(f)) { file = f; execArgv = ['--import', 'tsx']; } } catch { /* yok */ }
+  }
   if (!file) return refineGroup(group, ref, background, o);
   const { Worker } = await import('node:worker_threads');
   const t0 = Date.now();
+  // Paralel: çapa sayısı yüksekse alt yollar n paya bölünür, her tur n worker aynı anda koşar; tur sonunda her alt
+  // yol sahibinin sonucundan alınır (komşu paydaki değişiklikler bir sonraki turda görülür)
+  const os = await import('node:os');
+  const anchorsAll = refineTargets(group).reduce((s, t) => s + t.subpaths.reduce((a, sp) => a + sp.points.length, 0), 0);
+  const P = process.env.MV_PAR ? +process.env.MV_PAR : Math.max(1, Math.min(o.part ? 1 : 3, (os.availableParallelism?.() ?? os.cpus().length) - 2, Math.floor(anchorsAll / 400)));
+  if (P > 1) {
+    const budget = o.budgetMs ?? 6000, slice = o.sliceMs ?? 3000;
+    const st = Array.from({ length: P }, () => ({ steps: o.steps ?? REFINE_STEPS, resume: undefined as number[][][] | undefined }));
+    let cur = group, moves = 0, sweeps = 0, splits = 0, before = NaN, after = NaN, rounds = 0;
+    while (st.some((s) => s.steps.length) && Date.now() - t0 < budget) {
+      const left = budget - (Date.now() - t0);
+      const runOne = (k: number) => new Promise<{ group: GroupNode; report: RefineReport }>((resolve, reject) => {
+        const w = new Worker(file!, { execArgv, workerData: { group: cur, ref, background, opts: { ...o, part: { k, n: P }, skipFirstPaint: rounds > 0, steps: st[k].steps, resume: st[k].resume, budgetMs: Math.min(slice, left), maxReadBytes: o.maxReadBytes ?? 150e6 } } });
+        w.once('message', (m) => { resolve(m); void w.terminate(); });
+        w.once('error', reject);
+        w.once('exit', (code) => { if (code !== 0) reject(new Error(`refine worker çıkış ${code}`)); });
+      });
+      let res: { group: GroupNode; report: RefineReport }[];
+      try { res = await Promise.all(st.map((s, k) => (s.steps.length ? runOne(k) : Promise.resolve(null as any)))); }
+      catch { break; }
+      // Birleştir: alt yol sahibinden, düğüm rengi/kontur genişliği düğüm sahibinden
+      const merged = structuredClone(cur);
+      const mt = refineTargets(merged);
+      const own = refineOwnership(refineTargets(cur), P);
+      const rt = res.map((r) => (r ? refineTargets(r.group) : null));
+      mt.forEach((t, ti) => {
+        t.subpaths = t.subpaths.map((sp, si) => rt[own.sub[ti][si]]?.[ti]?.subpaths[si] ?? sp);
+        const nodeRes = rt[own.node[ti]]?.[ti];
+        if (nodeRes) t.style = nodeRes.style;
+      });
+      cur = merged;
+      let progressed = false;
+      res.forEach((r, k) => {
+        if (!r) return;
+        moves += r.report.moves; sweeps += r.report.sweeps; splits += r.report.splits;
+        if (r.report.moves || r.report.completedSteps) progressed = true;
+        st[k].steps = st[k].steps.slice(r.report.completedSteps);
+        st[k].resume = r.report.resume;
+        if (rounds === 0 && k === 0) before = r.report.before;
+        after = r.report.after;
+      });
+      rounds++;
+      if (!progressed) break;
+    }
+    if (cur !== group) group.children = cur.children;
+    return { before, after, moves, sweeps, splits, ms: Date.now() - t0, anchors: anchorsAll, completedSteps: Math.min(...st.map((s) => (o.steps ?? REFINE_STEPS).length - s.steps.length)) };
+  }
   const budget = o.budgetMs ?? 6000, slice = o.sliceMs ?? 2000;
   let steps = o.steps ?? REFINE_STEPS;
   let total: RefineReport | null = null;
@@ -467,7 +561,7 @@ export async function refineGroupIsolated(group: GroupNode, ref: { rgba: Uint8Cl
     let res: { group: GroupNode; report: RefineReport };
     try {
       res = await new Promise((resolve, reject) => {
-        const w = new Worker(file!, { workerData: { group: cur, ref, background, opts: { ...o, steps, resume, budgetMs: Math.min(slice, left), maxReadBytes: o.maxReadBytes ?? 150e6 } } });
+        const w = new Worker(file!, { execArgv, workerData: { group: cur, ref, background, opts: { ...o, steps, resume, skipFirstPaint: total !== null, budgetMs: Math.min(slice, left), maxReadBytes: o.maxReadBytes ?? 150e6 } } });
         w.once('message', (m) => { resolve(m); void w.terminate(); });
         w.once('error', reject);
         w.once('exit', (code) => { if (code !== 0) reject(new Error(`refine worker çıkış ${code}`)); });
