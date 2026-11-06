@@ -82,6 +82,7 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
     const m = pixel ? { ...compareDocument(doc, { rgba: img.rgba, width: img.width, height: img.height }).metrics, reference: 'kaynak' as const } : { ...compareDocument(doc, ref, { chroma: !!o.lossySource }).metrics, reference: refKind };
     return finish(r, m, opts);
   };
+  let hiRes: { r: TraceResult; m: any } | null = null;
   // Tüm pürüzsüz denemeler (optimizasyon için yedek adaylar)
   const pool: { r: TraceResult; m: any }[] = [];
   const finish = (r: TraceResult, m: any, opts: TraceOptions) => {
@@ -141,9 +142,15 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
         { ...o, gradients: best.r.group.name?.includes('bölge'), detail: 1, smoothness: Math.min(o.smoothness ?? 0.5, 0.2) },
         { ...o, gradients: !best.r.group.name?.includes('bölge'), detail: 1, smoothness: Math.min(o.smoothness ?? 0.5, 0.2) },
       ] : []),
+      // Daha yüksek çalışma çözünürlüğü (uzun kenar 2400): ince ayrıntılı kaynakta kenarlar daha hassas (kullanıcı
+      // bayrak dosyaları %0,58 → %0,50); bazı görsellerde daha kötü — optimizasyon sonrası yarıştırılır (aşağıda)
+      ...(img.width * img.height <= 1_000_000 && Math.max(img.width, img.height) < 1600 ? [
+        { ...o, gradients: best.r.group.name?.includes('bölge'), workSize: 2400 },
+      ] : []),
     ];
     for (const t of tries) {
       const c = await evaluate(t);
+      if (t.workSize) hiRes = c;
       // Hata belirgin düşüyorsa (≥%20) daha çok çapayı kabul et
       if (c.m.pctOff < best.m.pctOff * 0.8) best = c;
       if (best.m.pctOff <= 0.5) break;
@@ -154,6 +161,11 @@ export async function traceBest(img: DecodedImage, o: VectorizeImageOptions = {}
     const opt = await optimizeResult(best.r, best.m, ref!, typeof o.optimize === 'number' ? o.optimize : undefined, !!o.lossySource, refKind);
     const base = best;
     if (opt) best = finish(opt.r, opt.m, { ...o, optimize: true } as VectorizeImageOptions);
+    // Yüksek çözünürlüklü izleme: ham hâli seçilmese de optimize edilmiş hâli daha iyi olabilir
+    if (best.m.pctOff > 0.5 && hiRes && hiRes !== base && hiRes.r !== best.r) {
+      const oh = await optimizeResult(hiRes.r, hiRes.m, ref!, typeof o.optimize === 'number' ? o.optimize : undefined, !!o.lossySource, refKind);
+      if (oh && oh.m.pctOff < best.m.pctOff) best = finish(oh.r, oh.m, { ...o, optimize: true } as VectorizeImageOptions);
+    }
     // Hâlâ hedefin üstündeyse (küçük görsel): diğer en iyi 2 aday da optimize edilir — en iyi izleme her zaman
     // en iyi optimize edilmiş sonucu vermez (sivri köşeli kaba izleme alt pikselde daha iyi oturabilir)
     if (best.m.pctOff > 0.5 && img.width * img.height <= 262_144) {

@@ -48,6 +48,8 @@ export interface TraceOptions {
   segScale?: number;
   /** Kaynak kayıplı sıkıştırılmış (JPEG): palet/etiketleme gürültüsü giderilmiş görüntüde yapılır. */
   lossySource?: boolean;
+  /** (Gelişmiş) Çalışma çözünürlüğü hedefi: uzun kenar bu boyuta (≤ 4×) büyütülerek izlenir (varsayılan 1600). */
+  workSize?: number;
 }
 
 export interface TraceResult {
@@ -245,7 +247,8 @@ export async function traceImage(input: Buffer | DecodedImage, o: TraceOptions =
 
   // Çalışma ölçeği: kısa kenar küçükse büyüt (daha pürüzsüz kenar), çok büyükse küçült (hız)
   const longSide = Math.max(W, H);
-  let k = longSide < 1600 ? Math.min(4, 1600 / longSide) : longSide > 3200 ? 3200 / longSide : 1;
+  const KT = o.workSize ?? 1600;
+  let k = longSide < KT ? Math.min(4, KT / longSide) : longSide > 3200 ? 3200 / longSide : 1;
   if (preset === 'photo') k = Math.min(k, 1600 / longSide);
   k = Math.round(k * 100) / 100;
   const w = Math.max(1, Math.round(W * k)), h = Math.max(1, Math.round(H * k));
